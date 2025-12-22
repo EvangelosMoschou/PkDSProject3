@@ -1,0 +1,30 @@
+# Project 3 Walkthrough: Optimizing Large-Scale Parallel BFS on CUDA
+
+This walkthrough documents the optimizations implemented to handle massive graphs like Friendster (~1.8B edges, ~15GB) and Mawi (~35M nodes) on systems with limited VRAM (e.g., 16GB).
+
+## 1. Multi-Strategy Dispatcher
+The core of the implementation is a "Strategic Dispatcher" in `src/v3_shared/bfs_shared.cu`. It computes the estimated memory footprint before execution and selects the most efficient algorithm:
+- **In-Core BFS**: Used when the graph and buffers fit entirely in VRAM. Uses shared memory and warp-level cooperation.
+- **SOTA Async Streaming BFS**: Used when the graph exceeds VRAM but fits in combined System+VRAM. Uses explicitly managed streams and double-buffering.
+- **Memory-Efficient Union-Find**: A fallback for connectivity analysis when BFS buffers would exceed total system memory.
+
+## 2. SOTA Async Streaming BFS
+To handle graphs larger than VRAM, we implemented an Advanced Streaming BFS:
+- **Explicit Double Buffering**: We allocate two buffers (e.g., 1GB each) on the GPU and use two independent CUDA streams. While Stream 0 is processing a chunk of edges, Stream 1 is asynchronously copying the next chunk from Host to Device.
+- **Node-Aligned Strategy**: Traditional streaming BFS often requires the GPU to perform a binary search on the `row_ptr` to find which node an edge belongs to. Our implementation performs "Node Splitting" on the host. We group nodes into chunks such that their corresponding edges fit into our GPU buffers. This eliminates the need for binary search on the GPU.
+
+## 3. Hybrid BFS (Direction Optimization)
+Following the "Direction-Optimizing BFS" paper, the solver switches strategies based on frontier density:
+- **Top-Down (Small Frontier)**: Standard frontier-based exploration using shared memory to cache neighbors.
+- **Bottom-Up (Large Frontier)**: When the frontier exceeds a threshold (e.g., 1/20th of the graph), we switch to a Bottom-Up approach. This scans unvisited nodes and checks if any neighbor is in the frontier bitmap, significantly reducing random writes and frontier management overhead.
+- **Frontier Bitmaps**: Used to represent the frontier compactly (1 bit per node), improving cache locality during the Bottom-Up phase.
+
+## 4. Hardware-Level Memory Optimizations
+- **Zero-Copy Mapped Memory**: For the largest graphs (Friendster), we use `cudaHostRegister` with the `cudaHostRegisterMapped` flag on the `col_idx` array. This allows the GPU to access host memory over PCIe without a manual `cudaMemcpy`, acting as a global cache.
+- **8-bit Atomic CAS**: To save memory, we use `uint8_t` for distances. Since CUDA doesn't support atomic updates on bytes directly, we implemented a custom `atomicCAS_uint8` using 32-bit word alignment and bit masking.
+- **Stream Overlapping**: By using `cudaMemcpyAsync`, we achieve near-perfect overlap between edge data transfer (bottlenecked by PCIe) and computation (bottlenecked by VRAM latency).
+
+## 5. Usage and Performance
+- The implementation automatically detects the best strategy.
+- Verified to handle Friendster CSRBin files without "Illegal Memory Access" or "Out of Memory" errors on 16GB VRAM configurations.
+- Performance is optimized by balancing PCIe bandwidth and kernel throughput.

@@ -1,0 +1,131 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{float}
+
+% Code listing style
+\lstset{
+    language=C++,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{orange},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    frame=single,
+    breaklines=true
+}
+
+\title{Project 3: Parallel BFS using CUDA}
+\author{Your Name Here}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report presents the implementation and analysis of three different CUDA-based 
+Breadth-First Search (BFS) algorithms for graph traversal. The implementations 
+explore different parallelization strategies: dynamic thread assignment, chunk-based 
+processing, and shared memory with warp cooperation.
+\end{abstract}
+
+\section{Introduction}
+
+Breadth-First Search is a fundamental graph algorithm with applications in 
+social network analysis, shortest path finding, and graph connectivity. 
+This project explores GPU parallelization of BFS using NVIDIA CUDA.
+
+\section{Implementation}
+
+\subsection{Version 1: Dynamic Thread Assignment}
+
+Each thread dynamically picks up work from a shared frontier queue. When a 
+thread finishes processing its assigned node, it atomically fetches the next 
+available node.
+
+\textbf{Advantages:}
+\begin{itemize}
+    \item Good load balancing for irregular graphs
+    \item Handles high-degree nodes well
+\end{itemize}
+
+\textbf{Disadvantages:}
+\begin{itemize}
+    \item Atomic contention on frontier queue
+    \item Less predictable memory access patterns
+\end{itemize}
+
+\subsection{Version 2: Chunk-Based Processing}
+
+Each thread is assigned a fixed chunk of nodes to process, with an internal 
+for-loop iterating over the assigned range. This approach is similar to 
+pthreads-style parallelization.
+
+\textbf{Advantages:}
+\begin{itemize}
+    \item Simple implementation
+    \item Less atomic contention
+\end{itemize}
+
+\textbf{Disadvantages:}
+\begin{itemize}
+    \item Potential load imbalance
+    \item High-degree nodes can create bottlenecks
+\end{itemize}
+
+\subsection{Version 3: Shared Memory with Warp Cooperation}
+
+Threads within the same warp cooperate to process one node's neighbors. 
+Uses shared memory for efficient intra-block communication.
+
+\textbf{Advantages:}
+\begin{itemize}
+    \item Excellent memory coalescing
+    \item Efficient use of shared memory
+    \item Warp-level primitives reduce overhead
+\end{itemize}
+
+\textbf{Disadvantages:}
+\begin{itemize}
+    \item More complex implementation
+    \item Shared memory limits per block
+\end{itemize}
+
+\section{Experimental Setup}
+
+% TODO: Add your experimental setup details
+
+\section{Results}
+
+% TODO: Add performance results and comparisons
+
+\begin{table}[H]
+\centering
+\caption{Performance Comparison (time in ms)}
+\begin{tabular}{lrrr}
+\toprule
+Graph & Version 1 & Version 2 & Version 3 \\
+\midrule
+Graph 1 & - & - & - \\
+Graph 2 & - & - & - \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Analysis}
+
+% TODO: Add your analysis
+
+\section{Conclusion}
+
+% TODO: Add conclusions
+
+\end{document}

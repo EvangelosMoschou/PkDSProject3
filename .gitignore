@@ -1,0 +1,27 @@
+# Build artifacts
+obj/
+bin/
+*.o
+*.out
+*.exe
+
+# Large Data Files
+Mat Files/
+*.mat
+*.csrbin
+*.h5
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Project specific
+results/
+*.log
+*.txt
+!walkthrough.txt
+!README.md
+!assignment/README_ASSIGNMENT.md
