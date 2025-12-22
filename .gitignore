@@ -6,7 +6,8 @@ bin/
 *.exe
 
 # Large Data Files
-Mat Files/
+Mat Files/*
+!Mat Files/.gitkeep
 *.mat
 *.csrbin
 *.h5
