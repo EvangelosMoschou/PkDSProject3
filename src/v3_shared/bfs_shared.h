@@ -22,10 +22,10 @@
  * Run BFS with shared memory and warp cooperation
  *
  * @param graph     Graph in CSR format (must be on device)
- * @param source    Source node for BFS
+ * @param opts      BFS Options (includes source node and algo choice)
  * @return          BFS result with distances and timing
  */
-BFSResult *bfsShared(CSRGraph *graph, node_t source);
+BFSResult *bfsShared(CSRGraph *graph, BFSOptions *opts);
 
 /**
  * BFS kernel with shared memory

@@ -155,13 +155,26 @@ BFSOptions parseArgs(int argc, char **argv) {
   opts.verbose = false;
   opts.benchmark = false;
   opts.num_runs = 1;
+  opts.json_output = false;
+  opts.algorithm = ALGO_BFS;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       opts.verbose = true;
+    } else if (strcmp(argv[i], "--algo") == 0) {
+      if (i + 1 < argc) {
+        char *algo = argv[++i];
+        if (strcmp(algo, "afforest") == 0) {
+          opts.algorithm = ALGO_AFFOREST;
+        } else {
+          opts.algorithm = ALGO_BFS;
+        }
+      }
     } else if (strcmp(argv[i], "-n") == 0 ||
                strcmp(argv[i], "--no-validate") == 0) {
       opts.validate = false;
+    } else if (strcmp(argv[i], "--json") == 0) {
+      opts.json_output = true;
     } else if (strcmp(argv[i], "-b") == 0 ||
                strcmp(argv[i], "--benchmark") == 0) {
       opts.benchmark = true;
@@ -193,9 +206,11 @@ void printUsage(const char *program) {
   printf("Usage: %s [options] <graph_file>\n", program);
   printf("\nOptions:\n");
   printf("  -s, --source <n>     Source node for BFS (default: 0)\n");
+  printf("  --algo <type>        Algorithm: 'bfs' (default) or 'afforest'\n");
   printf("  -v, --verbose        Enable verbose output\n");
   printf("  -n, --no-validate    Skip validation against CPU\n");
   printf("  -b, --benchmark <n>  Run benchmark with n iterations\n");
+  printf("  --json               Output results in JSON format\n");
   printf("  -h, --help           Show this help message\n");
   printf("\nGraph file formats supported:\n");
   printf("  .txt    Edge list (first line: nodes edges)\n");

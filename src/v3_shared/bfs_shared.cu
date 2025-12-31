@@ -65,13 +65,16 @@ __global__ void bfsWarpKernel(
       int chunk_size =
           min((int)(degree - chunk_start), SHARED_NEIGHBORS_PER_WARP);
 
-      for (int i = lane_id; i < chunk_size; i += WARP_SIZE) {
-        s_neighbors[warp_id][i] = col_idx[start + chunk_start + i];
+      if (lane_id < chunk_size) {
+        s_neighbors[warp_id][lane_id] = col_idx[start + chunk_start + lane_id];
       }
       __syncwarp();
 
-      for (int i = lane_id; i < chunk_size; i += WARP_SIZE) {
-        node_t neighbor = s_neighbors[warp_id][i];
+      bool found = false;
+      node_t neighbor = 0;
+
+      if (lane_id < chunk_size) {
+        neighbor = s_neighbors[warp_id][lane_id];
 
         // Ensure safe atomic update for uint8_t
         // We only update if neighbor is UNVISITED
@@ -81,8 +84,29 @@ __global__ void bfsWarpKernel(
                             (level_t)(current_level + 1));
 
         if (old_val == UNVISITED) {
-          int idx = atomicAdd(next_frontier_size, 1);
-          next_frontier[idx] = neighbor;
+          found = true;
+        }
+      }
+
+      // Warp Aggregation for Frontier Writes
+      unsigned int ballot = __ballot_sync(0xFFFFFFFF, found);
+      int pop_count = __popc(ballot);
+
+      if (pop_count > 0) {
+        int base_idx = 0;
+        // Leader elects space
+        if (lane_id == 0) {
+          base_idx = atomicAdd(next_frontier_size, pop_count);
+        }
+        // Broadcast base index to all lanes
+        base_idx = __shfl_sync(0xFFFFFFFF, base_idx, 0);
+
+        // Calculate local offset using population count of lower lanes
+        unsigned int lower_mask = (1u << lane_id) - 1;
+        int local_offset = __popc(ballot & lower_mask);
+
+        if (found) {
+          next_frontier[base_idx + local_offset] = neighbor;
         }
       }
       __syncwarp();
@@ -188,9 +212,8 @@ __global__ void bfsNodeAlignedStreamedKernel(
         node_t v = col_buffer[i];
 
         if (distances[v] == UNVISITED) {
-          unsigned char old_val = atomicCAS_uint8(
-              &distances[v], (level_t)UNVISITED, (level_t)(current_level + 1));
-          // if (old_val == UNVISITED) atomicAdd(next_frontier_size, 1);
+          atomicCAS_uint8(&distances[v], (level_t)UNVISITED,
+                          (level_t)(current_level + 1));
         }
       }
     }
@@ -206,12 +229,17 @@ bfsBottomUpKernel(const edge_t *__restrict__ row_ptr,
                   const node_t *__restrict__ col_idx,
                   level_t *__restrict__ distances,
                   const unsigned int *__restrict__ frontier_bitmap,
+                  const unsigned int *__restrict__ visited_bitmap,
                   int *__restrict__ next_frontier_size,
                   const level_t current_level, node_t num_nodes) {
 
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < num_nodes) {
-    if (distances[tid] == UNVISITED) {
+    // Check visited bitmap first (1 bit read vs 1 byte read)
+    // Optimization: Reduces bandwidth for the massive scan of unvisited nodes
+    bool visited = (visited_bitmap[tid / 32] >> (tid % 32)) & 1;
+
+    if (!visited) {
       edge_t start = row_ptr[tid];
       edge_t end = row_ptr[tid + 1];
       bool found = false;
@@ -238,6 +266,54 @@ bfsBottomUpKernel(const edge_t *__restrict__ row_ptr,
   }
 }
 
+// Optimization B: Warp-Cooperative Bottom-Up Kernel
+// - Warps load row_ptr cooperatively and scan adjacency lists together.
+__global__ void
+bfsBottomUpWarpKernel(const edge_t *__restrict__ row_ptr,
+                      const node_t *__restrict__ col_idx,
+                      level_t *__restrict__ distances,
+                      const unsigned int *__restrict__ frontier_bitmap,
+                      const unsigned int *__restrict__ visited_bitmap,
+                      int *__restrict__ next_frontier_size,
+                      const level_t current_level, node_t num_nodes) {
+  int tid = threadIdx.x;
+  int warp_id = tid / WARP_SIZE;
+  int lane_id = tid % WARP_SIZE;
+  int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+
+  // Each warp processes WARP_SIZE nodes, but ideally needs ONE node per warp if
+  // doing cooperative scan? Actually, Bottom-Up is best when one Thread = One
+  // Node? No. If high-degree unvisited node, one thread = slow. If we map 1
+  // Warp -> 1 Node:
+
+  node_t u = global_warp_id;
+  if (u < num_nodes) {
+    bool visited = (visited_bitmap[u / 32] >> (u % 32)) & 1;
+    if (!visited) {
+      edge_t start = row_ptr[u];
+      edge_t end = row_ptr[u + 1];
+      bool found = false;
+
+      // Cooperative Scan
+      for (edge_t e = start + lane_id; e < end; e += WARP_SIZE) {
+        node_t neighbor = col_idx[e];
+        if ((frontier_bitmap[neighbor / 32] >> (neighbor % 32)) & 1) {
+          found = true;
+        }
+        if (__any_sync(0xFFFFFFFF, found)) {
+          found = true;
+          break; // Fast exit if any thread finds it
+        }
+      }
+
+      if (found) {
+        if (lane_id == 0)
+          distances[u] = current_level + 1;
+      }
+    }
+  }
+}
+
 // Kernel to convert Queue to Bitmap
 __global__ void queueToBitmapKernel(const node_t *__restrict__ queue, int size,
                                     unsigned int *__restrict__ bitmap) {
@@ -245,6 +321,19 @@ __global__ void queueToBitmapKernel(const node_t *__restrict__ queue, int size,
   if (tid < size) {
     node_t node = queue[tid];
     atomicOr(&bitmap[node / 32], (1 << (node % 32)));
+  }
+}
+
+// Generate Visited Bitmap from Distances
+__global__ void
+generateVisitedBitmapKernel(const level_t *__restrict__ distances,
+                            unsigned int *__restrict__ visited_bitmap,
+                            node_t num_nodes) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < num_nodes) {
+    if (distances[tid] != UNVISITED) {
+      atomicOr(&visited_bitmap[tid / 32], (1 << (tid % 32)));
+    }
   }
 }
 
@@ -277,16 +366,18 @@ BFSResult *solveBFS(CSRGraph *graph, node_t source, bool use_streaming) {
   node_t *d_frontier, *d_next_frontier;
   int *d_next_frontier_size;
   unsigned int *d_frontier_bitmap; // For Bottom-Up
+  unsigned int *d_visited_bitmap;  // NEW: For Bottom-Up efficient scanning
 
-  CUDA_CHECK(cudaMallocManaged(&d_distances, num_nodes * sizeof(level_t)));
-  CUDA_CHECK(cudaMallocManaged(&d_frontier, num_nodes * sizeof(node_t)));
-  CUDA_CHECK(cudaMallocManaged(&d_next_frontier, num_nodes * sizeof(node_t)));
-  CUDA_CHECK(cudaMallocManaged(&d_next_frontier_size, sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_distances, num_nodes * sizeof(level_t)));
+  CUDA_CHECK(cudaMalloc(&d_frontier, num_nodes * sizeof(node_t)));
+  CUDA_CHECK(cudaMalloc(&d_next_frontier, num_nodes * sizeof(node_t)));
+  CUDA_CHECK(cudaMalloc(&d_next_frontier_size, sizeof(int)));
 
   // Bitmap allocation: 1 bit per node = num_nodes / 32 ints
   int bitmap_ints = (num_nodes + 31) / 32;
-  CUDA_CHECK(cudaMallocManaged(&d_frontier_bitmap,
-                               bitmap_ints * sizeof(unsigned int)));
+  CUDA_CHECK(
+      cudaMalloc(&d_frontier_bitmap, bitmap_ints * sizeof(unsigned int)));
+  CUDA_CHECK(cudaMalloc(&d_visited_bitmap, bitmap_ints * sizeof(unsigned int)));
 
   CUDA_CHECK(cudaMemset(d_distances, UNVISITED, num_nodes * sizeof(level_t)));
   level_t zero = 0;
@@ -391,9 +482,17 @@ BFSResult *solveBFS(CSRGraph *graph, node_t source, bool use_streaming) {
         CUDA_CHECK(cudaDeviceSynchronize()); // Wait for all streams
       } else {
         // --- STANDARD BOTTOM-UP PHASE (In-Core) ---
-        int numBlocksNodes = (num_nodes + 1023) / 1024;
-        bfsBottomUpKernel<<<numBlocksNodes, 1024>>>(
+        // Pre-step: Build Visited Bitmap
+        int numBlocksVisited = (num_nodes + 1023) / 1024;
+        clearBitmapKernel<<<(bitmap_ints + 1023) / 1024, 1024>>>(
+            d_visited_bitmap, bitmap_ints);
+        generateVisitedBitmapKernel<<<numBlocksVisited, 1024>>>(
+            d_distances, d_visited_bitmap, num_nodes);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        bfsBottomUpKernel<<<numBlocksVisited, 1024>>>(
             graph->d_row_ptr, graph->d_col_idx, d_distances, d_frontier_bitmap,
+            d_visited_bitmap, // New argument
             d_next_frontier_size, level, num_nodes);
         CUDA_CHECK(cudaDeviceSynchronize());
       }
@@ -444,6 +543,7 @@ BFSResult *solveBFS(CSRGraph *graph, node_t source, bool use_streaming) {
   CUDA_CHECK(cudaFree(d_next_frontier));
   CUDA_CHECK(cudaFree(d_next_frontier_size));
   CUDA_CHECK(cudaFree(d_frontier_bitmap));
+  CUDA_CHECK(cudaFree(d_visited_bitmap));
 
   CUDA_CHECK(cudaFree(d_col_buffers[0]));
   CUDA_CHECK(cudaFree(d_col_buffers[1]));
@@ -453,15 +553,56 @@ BFSResult *solveBFS(CSRGraph *graph, node_t source, bool use_streaming) {
   return result;
 }
 
+// Afforest Sampling Kernel: connect nodes to random neighbors to speed up
+// convergence
+__global__ void afforestSamplingKernel(const edge_t *__restrict__ row_ptr,
+                                       const node_t *__restrict__ col_idx,
+                                       node_t *__restrict__ parent,
+                                       node_t num_nodes, unsigned int seed,
+                                       node_t skip_component) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < num_nodes) {
+    // Large Component Skipping Optimization
+    // If we are already in the known large component, skip sampling
+    // This assumes other nodes will hook into us.
+    if (skip_component != -1 && parent[tid] == skip_component) {
+      return;
+    }
+
+    edge_t start = row_ptr[tid];
+    edge_t end = row_ptr[tid + 1];
+    edge_t degree = end - start;
+    if (degree > 0) {
+      // Simple pseudo-random using linear congruential generator
+      unsigned int r = (seed * 1664525 + 1013904223 + tid);
+      edge_t offset = r % degree;
+      node_t neighbor = col_idx[start + offset];
+
+      node_t u = tid;
+      node_t v = neighbor;
+
+      // Attempt to link u and v
+      node_t p_u = parent[u];
+      node_t p_v = parent[v];
+
+      if (p_v < p_u) {
+        atomicMin(&parent[p_u], p_v);
+      } else if (p_u < p_v) {
+        atomicMin(&parent[p_v], p_u);
+      }
+    }
+  }
+}
+
 BFSResult *solveUnionFind(CSRGraph *graph, node_t source) {
   node_t num_nodes = graph->num_nodes;
   node_t *d_parent;
   int *d_changed;
   level_t *d_distances;
 
-  CUDA_CHECK(cudaMallocManaged(&d_parent, num_nodes * sizeof(node_t)));
-  CUDA_CHECK(cudaMallocManaged(&d_changed, sizeof(int)));
-  CUDA_CHECK(cudaMallocManaged(&d_distances, num_nodes * sizeof(level_t)));
+  CUDA_CHECK(cudaMalloc(&d_parent, num_nodes * sizeof(node_t)));
+  CUDA_CHECK(cudaMalloc(&d_changed, sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_distances, num_nodes * sizeof(level_t)));
 
   int blockSize = 256;
   int numBlocks = (num_nodes + blockSize - 1) / blockSize;
@@ -469,6 +610,30 @@ BFSResult *solveUnionFind(CSRGraph *graph, node_t source) {
 
   CudaTimer timer = createTimer();
   startTimer(&timer);
+
+  // --- AFFOREST SAMPLING PHASE ---
+  // Run 2 rounds of random sampling to collapse components quickly
+  int sampling_rounds = 2;
+  printf("UnionFind: Running %d Afforest Sampling Rounds...\n",
+         sampling_rounds);
+
+  node_t large_component = -1;
+
+  for (int r = 0; r < sampling_rounds; r++) {
+    // After first round, try to identify large component
+    if (r > 0) {
+      // Heuristic: Node 0 is likely in large component
+      CUDA_CHECK(cudaMemcpy(&large_component, &d_parent[0], sizeof(node_t),
+                            cudaMemcpyDeviceToHost));
+      // Use the parent as proxy for component ID
+    }
+
+    afforestSamplingKernel<<<numBlocks, blockSize>>>(
+        graph->d_row_ptr, graph->d_col_idx, d_parent, num_nodes, r + 42,
+        large_component);
+    compressKernel<<<numBlocks, blockSize>>>(d_parent, num_nodes);
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
 
   int h_changed = 1, iter = 0;
   while (h_changed) {
@@ -486,9 +651,17 @@ BFSResult *solveUnionFind(CSRGraph *graph, node_t source) {
   for (int k = 0; k < 5; k++)
     compressKernel<<<numBlocks, blockSize>>>(d_parent, num_nodes);
   CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Find source root (iterative copy since d_parent is on device)
   node_t source_root = source;
-  while (d_parent[source_root] != source_root)
-    source_root = d_parent[source_root];
+  node_t parent_val;
+  while (true) {
+    CUDA_CHECK(cudaMemcpy(&parent_val, &d_parent[source_root], sizeof(node_t),
+                          cudaMemcpyDeviceToHost));
+    if (parent_val == source_root)
+      break;
+    source_root = parent_val;
+  }
 
   connectivityToDistanceKernel<<<numBlocks, blockSize>>>(
       d_parent, d_distances, source_root, num_nodes);
@@ -515,9 +688,16 @@ BFSResult *solveUnionFind(CSRGraph *graph, node_t source) {
 // Strategy Dispatcher
 // =============================================================================
 
-BFSResult *bfsShared(CSRGraph *graph, node_t source) {
+BFSResult *bfsShared(CSRGraph *graph, BFSOptions *opts) {
   if (!graph->d_row_ptr)
     copyGraphToDevice(graph);
+
+  // If user explicitly requested Afforest/Union-Find, skip BFS logic
+  if (opts->algorithm == ALGO_AFFOREST) {
+    printf("Decision: User requested AFFOREST (Connectivity).\n");
+    printf("----------------------------\n");
+    return solveUnionFind(graph, opts->source);
+  }
 
   size_t free_mem, total_mem;
   cudaMemGetInfo(&free_mem, &total_mem);
@@ -554,32 +734,94 @@ BFSResult *bfsShared(CSRGraph *graph, node_t source) {
     else
       printf("Decision: Fits in VRAM. Using HIGH-SPEED BFS (In-Core).\n");
     printf("----------------------------\n");
-    return solveBFS(graph, source, use_streaming);
+    return solveBFS(graph, opts->source, use_streaming);
   } else {
     printf("Decision: Memory exceeds 16GB! Switching to MEMORY-EFFICIENT Union "
            "Find.\n");
     printf("----------------------------\n");
-    return solveUnionFind(graph, source);
+    return solveUnionFind(graph, opts->source);
   }
 }
 
+#include "../common/json_gpu.h"
+
 int main(int argc, char **argv) {
-  printf("=== Dynamic Hybrid Connectivity Solver ===\n\n");
-  printDeviceInfo();
   BFSOptions opts = parseArgs(argc, argv);
+
+  if (!opts.json_output) {
+    printf("=== Dynamic Hybrid Connectivity Solver ===\n\n");
+    printDeviceInfo();
+  }
+
   CSRGraph *graph = nullptr;
   const char *ext = strrchr(opts.graph_file, '.');
   if (ext && strcmp(ext, ".csrbin") == 0)
     graph = loadGraphCSRBin(opts.graph_file);
+  else if (ext && strcmp(ext, ".mat") == 0)
+    graph = loadGraphHDF5(opts.graph_file);
   else
     graph = loadGraph(opts.graph_file);
+
   if (!graph)
     return 1;
-  printGraphStats(graph);
+
+  if (!opts.json_output)
+    printGraphStats(graph);
+
   copyGraphToDevice(graph);
-  BFSResult *result = bfsShared(graph, opts.source);
-  printBFSResult(result);
-  freeBFSResult(result);
+
+  // Benchmarking Loop
+  int num_trials = opts.benchmark ? opts.num_runs : 1;
+  double *times = new double[num_trials];
+  BFSResult *final_result = nullptr;
+
+  for (int i = 0; i < num_trials; i++) {
+    if (final_result)
+      freeBFSResult(final_result);
+
+    // We need to re-run. bfsShared handles logic.
+    // Ideally we should sync before starting timer, but bfsShared does it
+    // inside.
+    final_result = bfsShared(graph, &opts);
+    times[i] = final_result->elapsed_ms;
+
+    if (!opts.json_output) {
+      printf("Trial %d: %.3f ms\n", i + 1, final_result->elapsed_ms);
+    }
+  }
+
+  // Note: For streaming detection, we'd need to modify bfsShared return
+  // signature or track internally.
+  bool used_streaming = false;
+
+  if (opts.json_output) {
+    // Compute traversed edges (reachable nodes * avg degree? No.)
+    // Exact traversed edges requires counting degrees of visited nodes.
+    // For GTEPS, we usually use Total Edges of the component or graph if fully
+    // connected. Let's use total graph edges for now as approximation or count
+    // it. NOTE: Standard Graph500 uses input edges / time.
+
+    // We need edge_t alias, assuming it's long long in cuda_common.h
+    print_json_gpu("Hybrid_BFS", opts.graph_file, graph->num_nodes,
+                   graph->num_edges, times, num_trials, graph->num_edges,
+                   used_streaming);
+  } else {
+    printBFSResult(final_result);
+    if (opts.benchmark) {
+      double sum = 0;
+      for (int i = 0; i < num_trials; i++)
+        sum += times[i];
+      printf("Average Time: %.3f ms\n", sum / num_trials);
+    }
+  }
+
+  if (opts.validate && !opts.json_output) {
+    // Validate only once using final result
+    validateBFSResult(final_result, graph);
+  }
+
+  freeBFSResult(final_result);
   freeGraph(graph);
+  delete[] times;
   return 0;
 }

@@ -1,77 +1,18 @@
 #include "bfs_dynamic.h"
 #include <cstring>
 
+#define CUDA_ATOMICS_IMPL
+#include "cuda_common.h"
+
 // =============================================================================
 // Version 1: Dynamic Thread Assignment BFS
 // =============================================================================
-//
-// Each thread dynamically picks up work from a shared frontier queue.
-// When a thread finishes processing a node, it atomically fetches the
-// next available node from the frontier.
-//
-// Pros:
-//   - Good load balancing for irregular graphs
-//   - Handles high-degree nodes well
-//
-// Cons:
-//   - Atomic contention on frontier queue
-//   - Less predictable memory access patterns
-// =============================================================================
 
 /**
- * Kernel: Each thread processes one node at a time from the frontier
- * Uses atomic operations to dynamically fetch work
+ * BFS Kernel: Each thread gets one node from frontier
+ * Simple but effective for most graphs
  */
 __global__ void bfsDynamicKernel(
-    const edge_t *__restrict__ row_ptr, const node_t *__restrict__ col_idx,
-    level_t *__restrict__ distances, const node_t *__restrict__ frontier,
-    const int frontier_size, node_t *__restrict__ next_frontier,
-    int *__restrict__ next_frontier_size, const level_t current_level) {
-  // Global work index - each thread picks up work dynamically
-  __shared__ int shared_work_idx;
-
-  if (threadIdx.x == 0) {
-    shared_work_idx = blockIdx.x * blockDim.x;
-  }
-  __syncthreads();
-
-  while (true) {
-    // Atomically get next work item
-    int my_work_idx;
-    if (threadIdx.x == 0) {
-      my_work_idx = atomicAdd(&shared_work_idx, blockDim.x);
-    }
-    // Broadcast to all threads in block
-    my_work_idx = __shfl_sync(0xFFFFFFFF, my_work_idx, 0) + threadIdx.x;
-
-    // Check if there's still work to do
-    if (my_work_idx >= frontier_size)
-      break;
-
-    node_t current = frontier[my_work_idx];
-    edge_t start = row_ptr[current];
-    edge_t end = row_ptr[current + 1];
-
-    // Process all neighbors
-    for (edge_t e = start; e < end; e++) {
-      node_t neighbor = col_idx[e];
-
-      // Try to mark as visited (atomic compare-and-swap)
-      if (atomicCAS(&distances[neighbor], UNVISITED, current_level + 1) ==
-          UNVISITED) {
-        // Successfully visited - add to next frontier
-        int idx = atomicAdd(next_frontier_size, 1);
-        next_frontier[idx] = neighbor;
-      }
-    }
-  }
-}
-
-/**
- * Alternative simpler kernel for comparison
- * Each thread gets one index from frontier
- */
-__global__ void bfsDynamicKernelSimple(
     const edge_t *__restrict__ row_ptr, const node_t *__restrict__ col_idx,
     level_t *__restrict__ distances, const node_t *__restrict__ frontier,
     const int frontier_size, node_t *__restrict__ next_frontier,
@@ -87,9 +28,11 @@ __global__ void bfsDynamicKernelSimple(
     for (edge_t e = start; e < end; e++) {
       node_t neighbor = col_idx[e];
 
-      // Atomically try to visit
-      if (atomicCAS(&distances[neighbor], UNVISITED, current_level + 1) ==
-          UNVISITED) {
+      // Atomically try to visit using uint8 helper
+      unsigned char old_val =
+          atomicCAS_uint8(&distances[neighbor], (level_t)UNVISITED,
+                          (level_t)(current_level + 1));
+      if (old_val == UNVISITED) {
         int idx = atomicAdd(next_frontier_size, 1);
         next_frontier[idx] = neighbor;
       }
@@ -109,13 +52,11 @@ BFSResult *bfsDynamic(CSRGraph *graph, node_t source) {
   level_t *d_distances;
   node_t *d_frontier;
   node_t *d_next_frontier;
-  int *d_frontier_size;
   int *d_next_frontier_size;
 
   CUDA_CHECK(cudaMallocManaged(&d_distances, num_nodes * sizeof(level_t)));
   CUDA_CHECK(cudaMallocManaged(&d_frontier, num_nodes * sizeof(node_t)));
   CUDA_CHECK(cudaMallocManaged(&d_next_frontier, num_nodes * sizeof(node_t)));
-  CUDA_CHECK(cudaMallocManaged(&d_frontier_size, sizeof(int)));
   CUDA_CHECK(cudaMallocManaged(&d_next_frontier_size, sizeof(int)));
 
   // Initialize distances to UNVISITED
@@ -130,8 +71,6 @@ BFSResult *bfsDynamic(CSRGraph *graph, node_t source) {
   CUDA_CHECK(
       cudaMemcpy(d_frontier, &source, sizeof(node_t), cudaMemcpyHostToDevice));
   int h_frontier_size = 1;
-  CUDA_CHECK(cudaMemcpy(d_frontier_size, &h_frontier_size, sizeof(int),
-                        cudaMemcpyHostToDevice));
 
   // Create timer
   CudaTimer timer = createTimer();
@@ -147,7 +86,7 @@ BFSResult *bfsDynamic(CSRGraph *graph, node_t source) {
     // Launch kernel
     int num_blocks = (h_frontier_size + BLOCK_SIZE_1D - 1) / BLOCK_SIZE_1D;
 
-    bfsDynamicKernelSimple<<<num_blocks, BLOCK_SIZE_1D>>>(
+    bfsDynamicKernel<<<num_blocks, BLOCK_SIZE_1D>>>(
         graph->d_row_ptr, graph->d_col_idx, d_distances, d_frontier,
         h_frontier_size, d_next_frontier, d_next_frontier_size, current_level);
     CUDA_CHECK_LAST();
@@ -183,7 +122,6 @@ BFSResult *bfsDynamic(CSRGraph *graph, node_t source) {
   CUDA_CHECK(cudaFree(d_distances));
   CUDA_CHECK(cudaFree(d_frontier));
   CUDA_CHECK(cudaFree(d_next_frontier));
-  CUDA_CHECK(cudaFree(d_frontier_size));
   CUDA_CHECK(cudaFree(d_next_frontier_size));
 
   return result;

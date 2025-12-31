@@ -50,6 +50,11 @@ CSRGraph *loadGraph(const char *filename);
 CSRGraph *loadGraphCSRBin(const char *filename);
 
 /**
+ * Load graph from HDF5 file (MAT-File v7.3)
+ */
+CSRGraph *loadGraphHDF5(const char *filename);
+
+/**
  * Save graph to CSR binary file
  */
 void saveGraphCSRBin(const CSRGraph *graph, const char *filename);

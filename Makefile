@@ -3,7 +3,7 @@
 # =============================================================================
 
 # Compiler
-NVCC = nvcc
+NVCC = /usr/local/cuda/bin/nvcc
 CXX = g++
 
 # Directories
@@ -12,24 +12,28 @@ INC_DIR = include
 BIN_DIR = bin
 OBJ_DIR = obj
 
+# HDF5 flags (Ported from Project 2)
+HDF5_INC = -I/usr/include/hdf5/serial
+HDF5_LIB = -L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5_serial
+
 # CUDA flags
 NVCC_FLAGS = -std=c++14 -O3 -arch=sm_86
-NVCC_FLAGS += -I$(INC_DIR) -I$(SRC_DIR)/common
+NVCC_FLAGS += -I$(INC_DIR) -I$(SRC_DIR)/common $(HDF5_INC)
 
 # Debug flags (uncomment for debugging)
 # NVCC_FLAGS += -g -G -DDEBUG
 
 # Linker flags
-LDFLAGS = -lcudart
+LDFLAGS = -L/usr/local/cuda/lib64 -lcudart $(HDF5_LIB)
 
 # Source files
-COMMON_SRCS = $(SRC_DIR)/common/graph.cu $(SRC_DIR)/common/utils.cu
+COMMON_SRCS = $(SRC_DIR)/common/graph.cu $(SRC_DIR)/common/utils.cu $(SRC_DIR)/common/json_gpu.cu $(SRC_DIR)/common/io_utils.cu
 V1_SRCS = $(SRC_DIR)/v1_dynamic/bfs_dynamic.cu
 V2_SRCS = $(SRC_DIR)/v2_chunked/bfs_chunked.cu
 V3_SRCS = $(SRC_DIR)/v3_shared/bfs_shared.cu
 
 # Object files
-COMMON_OBJS = $(OBJ_DIR)/graph.o $(OBJ_DIR)/utils.o
+COMMON_OBJS = $(OBJ_DIR)/graph.o $(OBJ_DIR)/utils.o $(OBJ_DIR)/json_gpu.o $(OBJ_DIR)/io_utils.o
 V1_OBJS = $(OBJ_DIR)/bfs_dynamic.o
 V2_OBJS = $(OBJ_DIR)/bfs_chunked.o
 V3_OBJS = $(OBJ_DIR)/bfs_shared.o
@@ -83,6 +87,12 @@ $(OBJ_DIR)/graph.o: $(SRC_DIR)/common/graph.cu
 
 $(OBJ_DIR)/utils.o: $(SRC_DIR)/common/utils.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/json_gpu.o: $(SRC_DIR)/common/json_gpu.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/io_utils.o: $(SRC_DIR)/common/io_utils.cu
+	$(NVCC) $(NVCC_FLAGS) -x cu -c -o $@ $<
 
 # Clean
 clean:

@@ -1,11 +1,18 @@
 #include "graph.h"
+#include "io_utils.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <vector>
 
 // =============================================================================
-// Graph Loading
+// Graph Loading (Text Format)
 // =============================================================================
 
 CSRGraph *loadGraph(const char *filename) {
@@ -68,38 +75,80 @@ CSRGraph *loadGraph(const char *filename) {
   return graph;
 }
 
+// Updated loadGraphCSRBin using pread_full
 CSRGraph *loadGraphCSRBin(const char *filename) {
-  FILE *file = fopen(filename, "rb");
-  if (!file) {
+  int fd = open(filename, O_RDONLY);
+  if (fd < 0) {
     fprintf(stderr, "Error: Cannot open file %s\n", filename);
     return nullptr;
   }
 
   CSRGraph *graph = new CSRGraph;
+  off_t offset = 0;
 
   // Read header (both are 8 bytes in our binary format)
   unsigned long long n, m;
-  if (fread(&n, sizeof(unsigned long long), 1, file) != 1 ||
-      fread(&m, sizeof(unsigned long long), 1, file) != 1) {
-    fprintf(stderr, "Error reading header from %s\n", filename);
-    fclose(file);
+
+  if (pread_full(fd, &n, sizeof(unsigned long long), offset) != 0) {
+    fprintf(stderr, "Error reading num_nodes from %s\n", filename);
+    close(fd);
+    delete graph;
     return nullptr;
   }
+  offset += sizeof(unsigned long long);
+
+  if (pread_full(fd, &m, sizeof(unsigned long long), offset) != 0) {
+    fprintf(stderr, "Error reading num_edges from %s\n", filename);
+    close(fd);
+    delete graph;
+    return nullptr;
+  }
+  offset += sizeof(unsigned long long);
+
   graph->num_nodes = (node_t)n;
   graph->num_edges = (edge_t)m;
 
-  // Allocate and read arrays
+  printf("Loading Graph Binary: Nodes=%d, Edges=%lld\n", graph->num_nodes,
+         (long long)graph->num_edges);
+
+  // Allocate arrays
+  // Note: For massive graphs, we might want to map this instead of new[],
+  // but let's stick to standard allocation for now and trust copyGraphToDevice
+  // to handle the GPU side. Friendster edges = 1.8B * 4 bytes = 7.2 GB. System
+  // RAM is 32GB, so this fits easily.
+
   graph->h_row_ptr = new edge_t[graph->num_nodes + 1];
   graph->h_col_idx = new node_t[graph->num_edges];
 
-  fread(graph->h_row_ptr, sizeof(edge_t), graph->num_nodes + 1, file);
-  fread(graph->h_col_idx, sizeof(node_t), graph->num_edges, file);
+  printf("Allocated Host Memory. Reading Data...\n");
 
-  fclose(file);
+  if (pread_full(fd, graph->h_row_ptr, (graph->num_nodes + 1) * sizeof(edge_t),
+                 offset) != 0) {
+    fprintf(stderr, "Error reading row_ptr from %s\n", filename);
+    close(fd);
+    delete[] graph->h_row_ptr;
+    delete[] graph->h_col_idx;
+    delete graph;
+    return nullptr;
+  }
+  offset += (graph->num_nodes + 1) * sizeof(edge_t);
+
+  if (pread_full(fd, graph->h_col_idx, graph->num_edges * sizeof(node_t),
+                 offset) != 0) {
+    fprintf(stderr, "Error reading col_idx from %s\n", filename);
+    close(fd);
+    delete[] graph->h_row_ptr;
+    delete[] graph->h_col_idx;
+    delete graph;
+    return nullptr;
+  }
+
+  close(fd);
 
   graph->d_row_ptr = nullptr;
   graph->d_col_idx = nullptr;
 
+  printf("Graph Loaded Successfully.\n");
   return graph;
 }
 
@@ -119,6 +168,129 @@ void saveGraphCSRBin(const CSRGraph *graph, const char *filename) {
   fwrite(graph->h_col_idx, sizeof(node_t), graph->num_edges, file);
 
   fclose(file);
+}
+
+// =============================================================================
+// HDF5 Loader
+// =============================================================================
+
+#include <hdf5.h>
+
+CSRGraph *loadGraphHDF5(const char *filename) {
+  printf("Loading HDF5 Graph: %s\n", filename);
+
+  // Turn off HDF5 auto-printing errors
+  H5Eset_auto(H5E_DEFAULT, NULL, NULL);
+
+  hid_t file_id = H5Fopen(filename, H5F_ACC_RDONLY, H5P_DEFAULT);
+  if (file_id < 0) {
+    fprintf(stderr, "Error: Cannot open HDF5 file %s\n", filename);
+    return nullptr;
+  }
+
+  // Navigate to /Problem/A
+  hid_t group_id = H5Gopen(file_id, "Problem", H5P_DEFAULT);
+  if (group_id < 0) {
+    H5Fclose(file_id);
+    fprintf(stderr, "Error: 'Problem' group not found in %s\n", filename);
+    return nullptr;
+  }
+  hid_t a_id = H5Gopen(group_id, "A", H5P_DEFAULT);
+  if (a_id < 0) {
+    H5Gclose(group_id);
+    H5Fclose(file_id);
+    fprintf(stderr, "Error: 'A' group/dataset not found in %s\n", filename);
+    return nullptr;
+  }
+
+  hid_t ir_dset = H5Dopen(a_id, "ir", H5P_DEFAULT);
+  hid_t jc_dset = H5Dopen(a_id, "jc", H5P_DEFAULT);
+
+  if (ir_dset < 0 || jc_dset < 0) {
+    fprintf(stderr, "Error: 'ir' or 'jc' datasets not found\n");
+    if (ir_dset >= 0)
+      H5Dclose(ir_dset);
+    if (jc_dset >= 0)
+      H5Dclose(jc_dset);
+    H5Gclose(a_id);
+    H5Gclose(group_id);
+    H5Fclose(file_id);
+    return nullptr;
+  }
+
+  // Get Dimensions
+  hid_t ir_space = H5Dget_space(ir_dset);
+  hid_t jc_space = H5Dget_space(jc_dset);
+
+  hsize_t nnz = H5Sget_simple_extent_npoints(ir_space);
+  hsize_t ncol_ptr = H5Sget_simple_extent_npoints(jc_space);
+
+  node_t num_nodes = (node_t)(ncol_ptr - 1);
+  edge_t num_edges = (edge_t)nnz;
+
+  printf("HDF5: Nodes=%d, Edges=%lld\n", num_nodes, (long long)num_edges);
+
+  CSRGraph *graph = new CSRGraph;
+  graph->num_nodes = num_nodes;
+  graph->num_edges = num_edges;
+
+  // Allocate Memory
+  printf(
+      "HDF5: Allocating Host Memory (%.2f GB)...\n",
+      (double)((num_nodes + 1) * sizeof(edge_t) + num_edges * sizeof(node_t)) /
+          1024.0 / 1024.0 / 1024.0);
+
+  graph->h_row_ptr = new edge_t[num_nodes + 1];
+  graph->h_col_idx = new node_t[num_edges];
+
+  // READ DATA
+  // Assumption: Symmetric Graph (CSC == CSR)
+  // jc -> row_ptr
+  // ir -> col_idx
+
+  printf("HDF5: Reading jc (row_ptr)...\n");
+  if (H5Dread(jc_dset, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+              graph->h_row_ptr) < 0) {
+    fprintf(stderr, "Error reading 'jc'\n");
+    delete[] graph->h_row_ptr;
+    delete[] graph->h_col_idx;
+    delete graph;
+    H5Dclose(ir_dset);
+    H5Dclose(jc_dset);
+    H5Gclose(a_id);
+    H5Gclose(group_id);
+    H5Fclose(file_id);
+    return nullptr;
+  }
+
+  printf("HDF5: Reading ir (col_idx)...\n");
+  if (H5Dread(ir_dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+              graph->h_col_idx) < 0) {
+    fprintf(stderr, "Error reading 'ir'\n");
+    delete[] graph->h_row_ptr;
+    delete[] graph->h_col_idx;
+    delete graph;
+    H5Dclose(ir_dset);
+    H5Dclose(jc_dset);
+    H5Gclose(a_id);
+    H5Gclose(group_id);
+    H5Fclose(file_id);
+    return nullptr;
+  }
+
+  printf("HDF5: Load Complete.\n");
+
+  H5Sclose(ir_space);
+  H5Sclose(jc_space);
+  H5Dclose(ir_dset);
+  H5Dclose(jc_dset);
+  H5Gclose(a_id);
+  H5Gclose(group_id);
+  H5Fclose(file_id);
+
+  graph->d_row_ptr = nullptr;
+  graph->d_col_idx = nullptr;
+  return graph;
 }
 
 CSRGraph *generateRandomGraph(node_t num_nodes, edge_t avg_degree) {
@@ -170,24 +342,35 @@ CSRGraph *generateRandomGraph(node_t num_nodes, edge_t avg_degree) {
 // Memory Management
 // =============================================================================
 
+#include "io_utils.h"
+#include <fcntl.h>
+#include <unistd.h>
+
+// =============================================================================
+// Memory Management
+// =============================================================================
+
 void copyGraphToDevice(CSRGraph *graph) {
   size_t row_ptr_size = (graph->num_nodes + 1) * sizeof(edge_t);
   size_t col_idx_size = graph->num_edges * sizeof(node_t);
 
-  // Allocate device memory (managed to support large graphs)
+  printf("Copying Graph to Device...\n");
+
   // Allocate device memory (managed to support large graphs)
   CUDA_CHECK(cudaMallocManaged(&graph->d_row_ptr, row_ptr_size));
   CUDA_CHECK(cudaMemcpy(graph->d_row_ptr, graph->h_row_ptr, row_ptr_size,
                         cudaMemcpyHostToDevice));
 
   // Huge Graph Optimization:
-  // If > 8GB, assume Friendster. Skip d_col_idx allocation.
-  // Friendster col_idx = 14GB. Host = 14GB. Unified = 14GB. Total 28GB. Too
-  // much. We will stream from Host Pinned Memory.
-  size_t huge_threshold = 8ULL * 1024 * 1024 * 1024;
+  // If > 4GB, use Zero-Copy to avoid VRAM Thrashing on 6GB cards.
+  // Friendster is ~7.2GB, so this will trigger.
+  size_t huge_threshold = 4ULL * 1024 * 1024 * 1024; // 4GB
+
   if (col_idx_size > huge_threshold) {
-    printf("NOTICE: Graph Edges > 8GB. Using Zero-Copy Mapped Memory for "
-           "col_idx.\n");
+    printf("NOTICE: Graph Edges > 4GB (Size: %.2f GB). Using Zero-Copy Mapped "
+           "Memory for col_idx.\n",
+           col_idx_size / (1024.0 * 1024.0 * 1024.0));
+
     // 1. Register Host Memory as Mapped (Device Accessible)
     CUDA_CHECK(cudaHostRegister(graph->h_col_idx, col_idx_size,
                                 cudaHostRegisterMapped));
@@ -195,14 +378,26 @@ void copyGraphToDevice(CSRGraph *graph) {
     CUDA_CHECK(cudaHostGetDevicePointer((void **)&graph->d_col_idx,
                                         (void *)graph->h_col_idx, 0));
   } else {
-    // Standard Allocation
+    // Standard Allocation in VRAM (Managed)
     CUDA_CHECK(cudaMallocManaged(&graph->d_col_idx, col_idx_size));
     CUDA_CHECK(cudaMemcpy(graph->d_col_idx, graph->h_col_idx, col_idx_size,
                           cudaMemcpyHostToDevice));
-    // For small graphs, we can also register for streaming optimization if
-    // needed, but Managed Memory handles Mawi fine.
-    CUDA_CHECK(cudaHostRegister(graph->h_col_idx, col_idx_size,
-                                cudaHostRegisterDefault));
+
+    // Advanced Memory Hints for VRAM Residents
+    int deviceId;
+    CUDA_CHECK(cudaGetDevice(&deviceId));
+
+    // Hint: Prefetch to GPU to avoid page faults during execution
+    CUDA_CHECK(
+        cudaMemPrefetchAsync(graph->d_row_ptr, row_ptr_size, deviceId, 0));
+    CUDA_CHECK(
+        cudaMemPrefetchAsync(graph->d_col_idx, col_idx_size, deviceId, 0));
+
+    // Hint: Data is read-mostly (enables caching)
+    CUDA_CHECK(cudaMemAdvise(graph->d_row_ptr, row_ptr_size,
+                             cudaMemAdviseSetReadMostly, deviceId));
+    CUDA_CHECK(cudaMemAdvise(graph->d_col_idx, col_idx_size,
+                             cudaMemAdviseSetReadMostly, deviceId));
   }
   // Remove duplicate calls from end of function
 
@@ -241,20 +436,27 @@ void freeGraph(CSRGraph *graph) {
 // =============================================================================
 
 void printGraphStats(const CSRGraph *graph) {
-  printf("=== Graph Statistics ===\n");
+  printf("Graph Stats:\n");
   printf("Nodes: %d\n", graph->num_nodes);
-  printf("Edges: %d\n", graph->num_edges);
-  printf("Average Degree: %.2f\n", (double)graph->num_edges / graph->num_nodes);
+  printf("Edges: %lld\n", (long long)graph->num_edges);
 
-  // Find min/max degree
-  edge_t min_deg = graph->num_edges, max_deg = 0;
+  // Calculate degrees to check stats
+  edge_t min_deg = graph->num_edges;
+  edge_t max_deg = 0;
+
+  // Checking degree of first few and last few if possible, or just skip full
+  // check for speed? Let's iterate all if not huge. Actually, printGraphStats
+  // iterates all.
   for (node_t i = 0; i < graph->num_nodes; i++) {
     edge_t deg = graph->h_row_ptr[i + 1] - graph->h_row_ptr[i];
-    min_deg = std::min(min_deg, deg);
-    max_deg = std::max(max_deg, deg);
+    if (deg < min_deg)
+      min_deg = deg;
+    if (deg > max_deg)
+      max_deg = deg;
   }
-  printf("Min Degree: %d\n", min_deg);
-  printf("Max Degree: %d\n", max_deg);
+
+  printf("Min Degree: %lld\n", (long long)min_deg);
+  printf("Max Degree: %lld\n", (long long)max_deg);
   printf("========================\n\n");
 }
 
@@ -271,8 +473,8 @@ bool validateGraph(const CSRGraph *graph) {
   // Check col_idx values are valid
   for (edge_t i = 0; i < graph->num_edges; i++) {
     if (graph->h_col_idx[i] < 0 || graph->h_col_idx[i] >= graph->num_nodes) {
-      fprintf(stderr, "Error: Invalid neighbor %d at edge %d\n",
-              graph->h_col_idx[i], i);
+      fprintf(stderr, "Error: Invalid neighbor %d at edge %lld\n",
+              graph->h_col_idx[i], (long long)i);
       return false;
     }
   }

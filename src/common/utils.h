@@ -81,6 +81,8 @@ BFSResult *bfsCPU(const CSRGraph *graph, node_t source);
 // Command Line Parsing
 // =============================================================================
 
+typedef enum { ALGO_BFS, ALGO_AFFOREST } AlgorithmType;
+
 typedef struct {
   char *graph_file;
   node_t source;
@@ -88,6 +90,8 @@ typedef struct {
   bool verbose;
   bool benchmark;
   int num_runs;
+  bool json_output;
+  AlgorithmType algorithm;
 } BFSOptions;
 
 /**
