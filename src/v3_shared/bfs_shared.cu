@@ -17,9 +17,6 @@
 // Kernels: BFS (Breadth-First Search)
 // =============================================================================
 
-// =============================================================================
-// Kernels: BFS (Breadth-First Search)
-// =============================================================================
 
 __global__ void bfsWarpKernel(
     const edge_t *__restrict__ row_ptr, const node_t *__restrict__ col_idx,
