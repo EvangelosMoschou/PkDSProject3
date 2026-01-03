@@ -28,8 +28,8 @@ LDFLAGS = -L/usr/local/cuda/lib64 -lcudart $(HDF5_LIB)
 
 # Source files
 COMMON_SRCS = $(SRC_DIR)/common/graph.cu $(SRC_DIR)/common/utils.cu $(SRC_DIR)/common/json_gpu.cu $(SRC_DIR)/common/io_utils.cu
-V1_SRCS = $(SRC_DIR)/v1_dynamic/bfs_dynamic.cu
-V2_SRCS = $(SRC_DIR)/v2_chunked/bfs_chunked.cu
+V1_SRCS = $(SRC_DIR)/legacy/v1_dynamic/bfs_dynamic.cu
+V2_SRCS = $(SRC_DIR)/legacy/v2_chunked/bfs_chunked.cu
 V3_SRCS = $(SRC_DIR)/v3_shared/bfs_shared.cu
 
 # Object files

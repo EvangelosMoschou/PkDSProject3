@@ -8,29 +8,35 @@
 // Version 2: Chunk-Based Processing BFS
 // =============================================================================
 
-/**
- * BFS Kernel: Each thread processes a chunk of nodes from the frontier
- */
+// =============================================================================
+// Device Helper Functions (Removed atomicCAS_uint8 as we use native atomics
+// now)
+// =============================================================================
+
+// =============================================================================
+// Kernel
+// =============================================================================
+
 __global__ void bfsChunkedKernel(
     const edge_t *__restrict__ row_ptr, const node_t *__restrict__ col_idx,
     level_t *__restrict__ distances, const node_t *__restrict__ frontier,
     const int frontier_size, node_t *__restrict__ next_frontier,
-    int *__restrict__ next_frontier_size, const level_t current_level,
-    const int chunk_size) {
+    int *__restrict__ next_frontier_size, const level_t current_level) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int chunk_start = tid * chunk_size;
-  int chunk_end = min(chunk_start + chunk_size, frontier_size);
 
-  for (int i = chunk_start; i < chunk_end; i++) {
-    node_t current = frontier[i];
+  if (tid < frontier_size) {
+    node_t current = frontier[tid];
     edge_t start = row_ptr[current];
     edge_t end = row_ptr[current + 1];
+    edge_t degree = end - start;
 
-    for (edge_t e = start; e < end; e++) {
-      node_t neighbor = col_idx[e];
-      unsigned char old_val =
-          atomicCAS_uint8(&distances[neighbor], (level_t)UNVISITED,
-                          (level_t)(current_level + 1));
+    for (edge_t i = 0; i < degree; i++) {
+      node_t neighbor = col_idx[start + i];
+
+      // Optimization: Native 32-bit Atomics
+      level_t old_val = atomicCAS(&distances[neighbor], (level_t)UNVISITED,
+                                  (level_t)(current_level + 1));
+
       if (old_val == UNVISITED) {
         int idx = atomicAdd(next_frontier_size, 1);
         next_frontier[idx] = neighbor;
@@ -80,8 +86,7 @@ BFSResult *bfsChunked(CSRGraph *graph, node_t source) {
 
     bfsChunkedKernel<<<num_blocks, BLOCK_SIZE_1D>>>(
         graph->d_row_ptr, graph->d_col_idx, d_distances, d_frontier,
-        h_frontier_size, d_next_frontier, d_next_frontier_size, current_level,
-        chunk_size);
+        h_frontier_size, d_next_frontier, d_next_frontier_size, current_level);
     CUDA_CHECK_LAST();
 
     // Get next frontier size

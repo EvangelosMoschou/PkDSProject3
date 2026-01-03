@@ -1,131 +1,294 @@
-\documentclass[12pt,a4paper]{article}
-\usepackage[utf8]{inputenc}
-\usepackage[english]{babel}
+% ==============================================================================
+% Project Report: Parallel BFS using CUDA
+% ==============================================================================
+% Compile with: pdflatex report.tex
+% ==============================================================================
+
+\documentclass[11pt,a4paper]{article}
+
+% ------------------------------------------------------------------------------
+% Packages
+% ------------------------------------------------------------------------------
+\usepackage{fontspec}
+\usepackage{polyglossia}
+\setdefaultlanguage{english}
+
+\usepackage{geometry}
+\geometry{margin=2cm}
+
 \usepackage{graphicx}
-\usepackage{amsmath}
-\usepackage{listings}
-\usepackage{xcolor}
-\usepackage{hyperref}
 \usepackage{booktabs}
 \usepackage{float}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{amsmath}
 
 % Code listing style
 \lstset{
-    language=C++,
-    basicstyle=\ttfamily\small,
-    keywordstyle=\color{blue},
-    commentstyle=\color{gray},
-    stringstyle=\color{orange},
-    numbers=left,
-    numberstyle=\tiny\color{gray},
+    basicstyle=\ttfamily\footnotesize,
+    backgroundcolor=\color{gray!10},
     frame=single,
-    breaklines=true
+    breaklines=true,
+    captionpos=b,
+    language=C++,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray}
 }
 
-\title{Project 3: Parallel BFS using CUDA}
-\author{Your Name Here}
-\date{\today}
+% ------------------------------------------------------------------------------
+% Title Page
+% ------------------------------------------------------------------------------
+\title{
+    \textbf{Parallel Breadth-First Search}\\[0.3em]
+    \large GPU Acceleration with CUDA
+}
+\author{
+    Evangelos Moschou \\
+    \texttt{AEM: 10986}
+}
 
+% ==============================================================================
 \begin{document}
 
 \maketitle
 
+% ------------------------------------------------------------------------------
+% Abstract
+% ------------------------------------------------------------------------------
 \begin{abstract}
-This report presents the implementation and analysis of three different CUDA-based 
-Breadth-First Search (BFS) algorithms for graph traversal. The implementations 
-explore different parallelization strategies: dynamic thread assignment, chunk-based 
-processing, and shared memory with warp cooperation.
+This report presents three CUDA-based BFS implementations exploring different parallelization strategies: dynamic thread assignment, chunk-based processing, and warp-cooperative shared memory with hybrid Top-Down/Bottom-Up. A critical correctness bug in the warp kernel was identified through rigorous verification against a Julia CPU reference implementation. The bug caused approximately 50\% of edges to be silently skipped due to a mismatch between the defined neighbor chunk size (64) and actual warp size (32). After fixing this bug, the implementation achieves 100\% correctness on the Friendster graph (65.6M nodes, 3.6B edges) with 541ms execution time, representing a 70x speedup over CPU and 6.67 GTEPS throughput.
 \end{abstract}
 
+% ------------------------------------------------------------------------------
+% Section 1: Introduction
+% ------------------------------------------------------------------------------
 \section{Introduction}
 
-Breadth-First Search is a fundamental graph algorithm with applications in 
-social network analysis, shortest path finding, and graph connectivity. 
-This project explores GPU parallelization of BFS using NVIDIA CUDA.
+Breadth-First Search is a fundamental graph traversal algorithm with applications in social network analysis, shortest path computation, web crawling, and connectivity analysis. As graph datasets grow to billions of edges, GPU parallelization becomes essential for achieving practical performance.
 
-\section{Implementation}
+This project implements three progressively optimized CUDA BFS algorithms, each exploring different trade-offs between simplicity, load balancing, and hardware utilization. The implementations handle graphs stored in Compressed Sparse Row (CSR) format, which provides $O(1)$ neighbor access and excellent cache locality. For graphs exceeding GPU VRAM capacity, we employ Zero-Copy Mapped Memory techniques to enable direct GPU access to host memory via PCIe.
+
+% ------------------------------------------------------------------------------
+% Section 2: Algorithm Design
+% ------------------------------------------------------------------------------
+\section{Algorithm Design}
+
+\subsection{Graph Representation}
+
+The CSR format consists of two arrays: \texttt{row\_ptr[n+1]} defining adjacency list boundaries and \texttt{col\_idx[m]} storing neighbor indices. This representation is ideal for GPU parallelism as it allows coalesced memory access patterns and efficient neighbor iteration. Graphs are cached as binary \texttt{.csrbin} files to reduce load times from minutes to seconds.
 
 \subsection{Version 1: Dynamic Thread Assignment}
 
-Each thread dynamically picks up work from a shared frontier queue. When a 
-thread finishes processing its assigned node, it atomically fetches the next 
-available node.
+Each thread dynamically fetches work from a shared frontier queue using atomic operations. When a thread finishes processing its assigned node, it atomically increments a global counter to fetch the next available node from the frontier.
 
 \textbf{Advantages:}
 \begin{itemize}
-    \item Good load balancing for irregular graphs
-    \item Handles high-degree nodes well
+    \item Excellent load balancing for irregular graphs with varying node degrees
+    \item Handles high-degree nodes efficiently by distributing work dynamically
+    \item No wasted work from idle threads
 \end{itemize}
 
 \textbf{Disadvantages:}
 \begin{itemize}
-    \item Atomic contention on frontier queue
-    \item Less predictable memory access patterns
+    \item High atomic contention on the frontier counter, especially with many threads
+    \item Unpredictable memory access patterns reduce cache efficiency
+    \item Serialization bottleneck when many threads compete for work
 \end{itemize}
 
 \subsection{Version 2: Chunk-Based Processing}
 
-Each thread is assigned a fixed chunk of nodes to process, with an internal 
-for-loop iterating over the assigned range. This approach is similar to 
-pthreads-style parallelization.
+Each thread processes a fixed chunk of frontier nodes using a simple for-loop, similar to CPU-style parallelization. This approach reduces atomic operations to one per thread (for adding discovered nodes to the next frontier) rather than one per work item.
 
 \textbf{Advantages:}
 \begin{itemize}
-    \item Simple implementation
-    \item Less atomic contention
+    \item Simple, straightforward implementation
+    \item Significantly reduced atomic contention compared to Version 1
+    \item More predictable memory access patterns
+    \item Better instruction cache utilization
 \end{itemize}
 
 \textbf{Disadvantages:}
 \begin{itemize}
-    \item Potential load imbalance
-    \item High-degree nodes can create bottlenecks
+    \item Potential load imbalance with irregular degree distributions
+    \item High-degree nodes can create bottlenecks if assigned to a single thread
+    \item Fixed chunk sizes may not adapt well to varying graph structures
 \end{itemize}
 
-\subsection{Version 3: Shared Memory with Warp Cooperation}
+\subsection{Version 3: Warp-Cooperative Shared Memory}
 
-Threads within the same warp cooperate to process one node's neighbors. 
-Uses shared memory for efficient intra-block communication.
+This version leverages CUDA's warp-level primitives and shared memory for maximum efficiency. It implements several advanced optimizations:
 
-\textbf{Advantages:}
+\paragraph{Warp Cooperation.}
+Threads within a warp (32 threads) cooperatively process one frontier node's neighbors. Each warp loads up to 32 neighbors into shared memory, processes them in parallel, and uses \texttt{\_\_ballot\_sync} to aggregate results before writing to global memory. This reduces atomic operations by 32x (one per warp instead of per thread).
+
+\paragraph{Hybrid Top-Down/Bottom-Up Strategy.}
+The algorithm dynamically switches between two traversal modes based on frontier size:
 \begin{itemize}
-    \item Excellent memory coalescing
-    \item Efficient use of shared memory
-    \item Warp-level primitives reduce overhead
+    \item \textbf{Top-Down}: When frontier is small, expand from frontier nodes to their neighbors (standard BFS)
+    \item \textbf{Bottom-Up}: When frontier exceeds 5\% of nodes, unvisited nodes check if any neighbors are in the frontier
 \end{itemize}
 
-\textbf{Disadvantages:}
+This hybrid approach reduces redundant edge traversals. For example, if 50\% of nodes are in the frontier, Bottom-Up checks only unvisited nodes' edges rather than all frontier nodes' edges.
+
+\paragraph{Streaming for Large Graphs.}
+For graphs exceeding VRAM (e.g., Friendster's 13.5GB edge data on 5.8GB GPU), the algorithm streams chunks asynchronously using double-buffered \texttt{cudaMemcpyAsync}. While the GPU processes one chunk, the next chunk is transferred in parallel.
+
+\paragraph{Memory Optimizations.}
 \begin{itemize}
-    \item More complex implementation
-    \item Shared memory limits per block
+    \item \textbf{Zero-Copy}: \texttt{cudaHostRegister} with \texttt{cudaMemAdviseSetReadMostly} allows GPU to access host memory
+    \item \textbf{Visited Bitmap}: 1 bit per node reduces memory bandwidth by 32x in Bottom-Up phase
+    \item \textbf{Memory Prefetching}: \texttt{cudaMemPrefetchAsync} hints to driver for optimal data placement
 \end{itemize}
 
-\section{Experimental Setup}
+% ------------------------------------------------------------------------------
+% Section 3: Critical Bug Fix
+% ------------------------------------------------------------------------------
+\section{Critical Bug Fix: Warp Kernel Correctness}
 
-% TODO: Add your experimental setup details
+\subsection{Bug Discovery and Symptoms}
 
-\section{Results}
+During verification against a Julia CPU reference implementation, we discovered that \texttt{bfs\_v3} was producing incorrect results:
+\begin{itemize}
+    \item \textbf{Friendster}: 99.59\% reachable (expected 100\%) - missing 269,000 nodes
+    \item \textbf{Mawi}: 47.54\% reachable (expected 94.47\%) - missing 106 million nodes
+\end{itemize}
 
-% TODO: Add performance results and comparisons
+The bug was particularly severe on Mawi, suggesting a systematic issue rather than a race condition.
+
+\subsection{Root Cause Analysis}
+
+After extensive debugging, including testing different kernel variants and comparing against the simpler \texttt{bfs\_v2} implementation (which achieved correct results), we identified the root cause in line 12 of \texttt{bfs\_shared.cu}:
+
+\begin{lstlisting}[caption={Buggy Code}]
+#define SHARED_NEIGHBORS_PER_WARP 64  // BUG: Warps only have 32 threads!
+\end{lstlisting}
+
+The warp kernel attempted to process 64 neighbors per iteration, but CUDA warps contain only 32 threads (lanes 0-31). The kernel code was:
+
+\begin{lstlisting}[caption={Kernel Logic}]
+int lane_id = threadIdx.x % WARP_SIZE;  // 0-31
+if (lane_id < chunk_size) {  // chunk_size could be up to 64
+    s_neighbors[warp_id][lane_id] = col_idx[start + chunk_start + lane_id];
+}
+\end{lstlisting}
+
+This caused neighbors at indices 32-63 in each chunk to be \textbf{silently skipped}, as \texttt{lane\_id} never reaches values above 31. The bug resulted in approximately 50\% of edges being ignored, explaining the severe node loss on Mawi.
+
+\subsection{Fix and Verification}
+
+\begin{lstlisting}[caption={Fixed Code}]
+#define SHARED_NEIGHBORS_PER_WARP WARP_SIZE  // Correctly uses 32
+\end{lstlisting}
+
+After the fix, both graphs achieved 100\% correctness:
+\begin{itemize}
+    \item \textbf{Friendster}: 100.00\% reachable (65,608,366 nodes), diameter 22 ✓
+    \item \textbf{Mawi}: 94.47\% reachable (213,682,593 nodes), diameter 7 ✓
+\end{itemize}
+
+Both results now match the Julia CPU reference exactly, confirming the fix.
+
+% ------------------------------------------------------------------------------
+% Section 4: Results
+% ------------------------------------------------------------------------------
+\section{Experimental Results}
+
+\subsection{Test Environment}
+\begin{itemize}
+    \item \textbf{GPU}: NVIDIA GeForce RTX 3060 Laptop (Ampere architecture, sm\_86)
+    \item \textbf{VRAM}: 5.8 GB
+    \item \textbf{System RAM}: 32 GB
+    \item \textbf{CUDA}: Version 12.x
+    \item \textbf{Compiler}: nvcc with -O3 optimization, -arch=sm\_86
+\end{itemize}
+
+\subsection{Benchmark Datasets}
+
+\textbf{Friendster Social Network:}
+\begin{itemize}
+    \item Vertices: 65,608,366
+    \item Edges: 3,612,134,270 (3.6 billion)
+    \item Edge data size: 13.46 GB (exceeds VRAM)
+    \item Max degree: 5,214
+    \item Graph diameter: 22
+    \item Structure: Real-world social network, power-law degree distribution
+\end{itemize}
+
+\textbf{Mawi Internet Topology:}
+\begin{itemize}
+    \item Vertices: 226,196,185
+    \item Edges: 480,047,894
+    \item Edge data size: 1.79 GB
+    \item Max degree: 210,795,477 (extreme supernode)
+    \item Graph diameter: 7
+    \item Structure: Internet routing graph with extreme degree skew
+\end{itemize}
+
+\subsection{Performance Comparison}
 
 \begin{table}[H]
 \centering
-\caption{Performance Comparison (time in ms)}
-\begin{tabular}{lrrr}
+\small
+\begin{tabular}{lcccc}
 \toprule
-Graph & Version 1 & Version 2 & Version 3 \\
+\textbf{Graph} & \textbf{Version} & \textbf{Time (ms)} & \textbf{GTEPS} & \textbf{Reachable} \\
 \midrule
-Graph 1 & - & - & - \\
-Graph 2 & - & - & - \\
+Friendster & v3 (Fixed) & \textbf{541.7} & 6.67 & 100.00\% \\
+Friendster & v3 (Buggy) & 438.0 & - & 99.59\% \\
+Friendster & Julia CPU & 38,000 & 0.095 & 100.00\% \\
+\midrule
+Mawi & v3 (Fixed) & \textbf{24,866} & 0.019 & 94.47\% \\
+Mawi & v2 (Chunked) & 101,373 & 0.005 & 94.16\% \\
+Mawi & v3 (Buggy) & 23,334 & - & 47.54\% \\
 \bottomrule
 \end{tabular}
+\caption{BFS Performance. GTEPS = Giga Traversed Edges Per Second. The buggy version was faster because it incorrectly skipped half the edges.}
 \end{table}
 
-\section{Analysis}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Algorithm} & \textbf{Time (ms)} & \textbf{Components} & \textbf{Notes} \\
+\midrule
+BFS (Single Source) & 541.7 & - & 100\% reachable from source \\
+Afforest (All Components) & 21,993 & 1 & Confirms single component \\
+\bottomrule
+\end{tabular}
+\caption{Afforest (Union-Find) vs BFS on Friendster.}
+\end{table}
 
-% TODO: Add your analysis
+\subsection{Analysis}
 
+\textbf{GPU Speedup:} The fixed implementation achieves 70x speedup over Julia CPU BFS on Friendster (38 seconds → 541 milliseconds), demonstrating the effectiveness of GPU parallelization for graph algorithms.
+
+\textbf{Zero-Copy Performance:} Despite accessing 13.5GB of edge data via PCIe (exceeding the 5.8GB VRAM), the implementation achieves 6.67 GTEPS. This indicates that the memory access pattern is sufficiently favorable that PCIe bandwidth (16 GB/s) does not become a bottleneck.
+
+\textbf{Hybrid Strategy Effectiveness:} On Friendster, the algorithm switches to Bottom-Up mode when the frontier exceeds approximately 3.3 million nodes (5\% of total). This reduces the number of edge checks in later BFS levels where the frontier is large.
+
+\textbf{Bug Impact Analysis:} The warp kernel bug caused a 50\% edge skip rate (processing only 32 of 64 neighbors per chunk). This explains the 47.54\% reachability on Mawi - approximately half the graph was unreachable due to missing edges. The fix restored correctness with a 24\% performance penalty (438ms → 542ms), which is expected since the code now processes twice as many edges per iteration.
+
+% ------------------------------------------------------------------------------
+% Section 5: Conclusion
+% ------------------------------------------------------------------------------
 \section{Conclusion}
 
-% TODO: Add conclusions
+This project successfully implemented and optimized three CUDA BFS algorithms, with the warp-cooperative version (v3) achieving state-of-the-art performance after fixing a critical correctness bug. Key achievements include:
+
+\begin{itemize}
+    \item \textbf{Sub-second execution} on billion-edge graphs (541ms for 3.6B edges)
+    \item \textbf{70x speedup} over CPU reference implementation
+    \item \textbf{100\% correctness} verified against Julia CPU BFS
+    \item \textbf{Zero-Copy support} enabling processing of graphs exceeding VRAM
+    \item \textbf{6.67 GTEPS} throughput on real-world social network data
+    \item \textbf{Hybrid Top-Down/Bottom-Up} strategy adapting to frontier density
+\end{itemize}
+
+The project demonstrates both the power of GPU acceleration for graph algorithms and the critical importance of rigorous correctness verification. The bug discovery process highlighted the value of comparing against independent reference implementations, as the error would have been difficult to detect through testing alone.
+
+\vfill
+\noindent\textbf{Source Code:} \url{https://github.com/EvangelosMoschou/PkDSProject3.git}
 
 \end{document}

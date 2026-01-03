@@ -43,9 +43,9 @@
 // Maximum shared memory per block (adjust based on GPU architecture)
 #define MAX_SHARED_MEM 49152 // 48 KB
 
-// BFS level constants (optimized for uint8_t)
-#define UNVISITED 255
-#define INF_DISTANCE 254
+// BFS level constants (optimized for native atomics)
+#define UNVISITED 0xFFFFFFFF
+#define INF_DISTANCE 0xFFFFFFFE
 
 // =============================================================================
 // Type Definitions
@@ -53,7 +53,7 @@
 
 typedef int node_t;            // Node ID type
 typedef long long edge_t;      // Edge count type
-typedef unsigned char level_t; // BFS level type (max 255 levels)
+typedef unsigned int level_t;  // BFS level type (native 32-bit for hardware atomics)
 
 // =============================================================================
 // Utility Functions

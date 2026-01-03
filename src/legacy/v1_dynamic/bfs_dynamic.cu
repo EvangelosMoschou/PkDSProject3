@@ -5,6 +5,11 @@
 #include "cuda_common.h"
 
 // =============================================================================
+// Device Helper Functions (Removed atomicCAS_uint8 as we use native atomics
+// now)
+// =============================================================================
+
+// =============================================================================
 // Version 1: Dynamic Thread Assignment BFS
 // =============================================================================
 
@@ -15,7 +20,7 @@
 __global__ void bfsDynamicKernel(
     const edge_t *__restrict__ row_ptr, const node_t *__restrict__ col_idx,
     level_t *__restrict__ distances, const node_t *__restrict__ frontier,
-    const int frontier_size, node_t *__restrict__ next_frontier,
+    int frontier_size, node_t *__restrict__ next_frontier,
     int *__restrict__ next_frontier_size, const level_t current_level) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -25,13 +30,12 @@ __global__ void bfsDynamicKernel(
     edge_t end = row_ptr[current + 1];
 
     // Process all neighbors of this node
-    for (edge_t e = start; e < end; e++) {
-      node_t neighbor = col_idx[e];
+    for (edge_t i = start; i < end; i++) {
+      node_t neighbor = col_idx[i];
 
-      // Atomically try to visit using uint8 helper
-      unsigned char old_val =
-          atomicCAS_uint8(&distances[neighbor], (level_t)UNVISITED,
-                          (level_t)(current_level + 1));
+      // Optimization: Native 32-bit Atomics
+      level_t old_val = atomicCAS(&distances[neighbor], (level_t)UNVISITED,
+                                  (level_t)(current_level + 1));
       if (old_val == UNVISITED) {
         int idx = atomicAdd(next_frontier_size, 1);
         next_frontier[idx] = neighbor;

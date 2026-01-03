@@ -26,3 +26,16 @@ results/
 !walkthrough.txt
 !README.md
 !assignment/README_ASSIGNMENT.md
+
+# Report artifacts
+Report/Report-Example/
+*.aux
+*.pdf
+*.synctex.gz
+
+# PGO artifacts
+*.gcda
+*.gcno
+
+# Antigravity brain artifacts
+.gemini/
