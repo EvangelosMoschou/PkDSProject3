@@ -899,6 +899,9 @@ int main(int argc, char **argv) {
     if (opts.compression && c_graph) {
       if (opts.algorithm == ALGO_ADAPTIVE) {
         final_result = solveBFSCompressedAdaptive(c_graph, opts.source);
+      } else if (opts.algorithm == ALGO_AFFOREST) {
+        solveAfforestCompressed(c_graph);
+        final_result = nullptr;
       } else {
         final_result = solveBFSCompressed(c_graph, opts.source);
       }

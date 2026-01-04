@@ -28,65 +28,41 @@ LDFLAGS = -L/usr/local/cuda/lib64 -lcudart $(HDF5_LIB)
 
 # Source files
 COMMON_SRCS = $(SRC_DIR)/common/graph.cu $(SRC_DIR)/common/utils.cu $(SRC_DIR)/common/json_gpu.cu $(SRC_DIR)/common/io_utils.cu $(SRC_DIR)/common/compression.cu
-V1_SRCS = $(SRC_DIR)/v1_dynamic/bfs_dynamic.cu
-V2_SRCS = $(SRC_DIR)/v2_chunked/bfs_chunked.cu
-V3_SRCS = $(SRC_DIR)/v3_shared/bfs_shared.cu $(SRC_DIR)/v4_adaptive/bfs_adaptive.cu
+V3_SRCS = $(SRC_DIR)/legacy/v3_shared/bfs_shared.cu $(SRC_DIR)/v4_adaptive/bfs_adaptive.cu
 
 # Object files
 COMMON_OBJS = $(OBJ_DIR)/graph.o $(OBJ_DIR)/utils.o $(OBJ_DIR)/json_gpu.o $(OBJ_DIR)/io_utils.o $(OBJ_DIR)/compression.o
-V1_OBJS = $(OBJ_DIR)/bfs_dynamic.o
-V2_OBJS = $(OBJ_DIR)/bfs_chunked.o
 V3_OBJS = $(OBJ_DIR)/bfs_shared.o $(OBJ_DIR)/bfs_adaptive.o \
           $(OBJ_DIR)/bfs_compressed_kernels.o $(OBJ_DIR)/bfs_compressed_adaptive.o \
           $(OBJ_DIR)/afforest.o
 
 # Executables
-V1_BIN = $(BIN_DIR)/bfs_v1
-V2_BIN = $(BIN_DIR)/bfs_v2
 V3_BIN = $(BIN_DIR)/bfs_v3
 
 # =============================================================================
 # Targets
 # =============================================================================
 
-.PHONY: all v1 v2 v3 clean dirs
+.PHONY: all v3 clean dirs
 
-all: dirs v1 v2 v3
+all: dirs v3
 
 dirs:
 	@mkdir -p $(BIN_DIR) $(OBJ_DIR)
 
-# Version 1: Dynamic Thread Assignment
-v1: dirs $(V1_BIN)
-
-$(V1_BIN): $(COMMON_OBJS) $(V1_OBJS)
-	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
-
-$(OBJ_DIR)/bfs_dynamic.o: $(V1_SRCS)
-	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
-
-# Version 2: Chunk-Based Processing
-v2: dirs $(V2_BIN)
-
-$(V2_BIN): $(COMMON_OBJS) $(V2_OBJS)
-	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
-
-$(OBJ_DIR)/bfs_chunked.o: $(V2_SRCS)
-	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
-
-# Version 3: Shared Memory with Warp Cooperation
+# Version 3: Production Build (Adaptive BFS + Compressed BFS + Afforest)
 v3: dirs $(V3_BIN)
 
 $(V3_BIN): $(COMMON_OBJS) $(V3_OBJS)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
 
-$(OBJ_DIR)/bfs_shared.o: $(V3_SRCS)
+$(OBJ_DIR)/bfs_shared.o: $(SRC_DIR)/legacy/v3_shared/bfs_shared.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
 $(OBJ_DIR)/bfs_adaptive.o: $(SRC_DIR)/v4_adaptive/bfs_adaptive.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/bfs_compressed_kernels.o: $(SRC_DIR)/v3_shared/bfs_compressed_kernels.cu
+$(OBJ_DIR)/bfs_compressed_kernels.o: $(SRC_DIR)/legacy/v3_shared/bfs_compressed_kernels.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
 $(OBJ_DIR)/bfs_compressed_adaptive.o: $(SRC_DIR)/v4_adaptive/bfs_compressed_adaptive.cu
@@ -128,9 +104,9 @@ clean:
 # Help
 help:
 	@echo "Available targets:"
-	@echo "  all     - Build all versions"
-	@echo "  v1      - Build Version 1 (Dynamic Thread Assignment)"
-	@echo "  v2      - Build Version 2 (Chunk-Based Processing)"
-	@echo "  v3      - Build Version 3 (Shared Memory + Warp Cooperation)"
+	@echo "  all     - Build production version (v3)"
+	@echo "  v3      - Build v3 (Adaptive BFS + Compressed BFS + Afforest)"
 	@echo "  clean   - Remove build files"
 	@echo "  help    - Show this help message"
+	@echo ""
+	@echo "Legacy versions (v1, v2) are archived in src/legacy/"

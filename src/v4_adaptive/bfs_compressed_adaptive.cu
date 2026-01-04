@@ -1,5 +1,5 @@
 #define CUDA_ATOMICS_IMPL
-#include "../v3_shared/bfs_compressed_kernel.cuh"
+#include "../legacy/v3_shared/bfs_compressed_kernel.cuh"
 #include "cuda_common.h"
 #include "graph.h"
 #include "utils.h"
