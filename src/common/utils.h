@@ -3,7 +3,6 @@
 
 #include "cuda_common.h"
 #include "graph.h"
-
 // =============================================================================
 // Timer Utilities
 // =============================================================================
@@ -81,7 +80,7 @@ BFSResult *bfsCPU(const CSRGraph *graph, node_t source);
 // Command Line Parsing
 // =============================================================================
 
-typedef enum { ALGO_BFS, ALGO_AFFOREST } AlgorithmType;
+typedef enum { ALGO_BFS, ALGO_AFFOREST, ALGO_ADAPTIVE } AlgorithmType;
 
 typedef struct {
   char *graph_file;
@@ -91,6 +90,7 @@ typedef struct {
   bool benchmark;
   int num_runs;
   bool json_output;
+  bool compression;
   AlgorithmType algorithm;
 } BFSOptions;
 

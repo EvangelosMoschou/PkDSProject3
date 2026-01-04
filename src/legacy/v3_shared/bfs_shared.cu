@@ -1,3 +1,5 @@
+#include "../common/compression.h"
+#include "../v4_adaptive/bfs_adaptive.h"
 #include "bfs_shared.h"
 #include <cstring>
 
@@ -497,6 +499,84 @@ BFSResult *solveUnionFind(CSRGraph *graph, node_t source) {
 // Strategy Dispatcher
 // =============================================================================
 
+// Include the compressed kernel logic
+#include "bfs_compressed_kernel.cuh"
+
+// ... (Rest of BFS Shared logic helper)
+
+// BFS Result *solveBFSCompressed(...)
+BFSResult *solveBFSCompressed(CompressedCSRGraph *graph, node_t source) {
+  // Adapter to run BFS on c-CSR
+  node_t num_nodes = graph->num_nodes;
+  level_t *d_distances;
+  node_t *d_frontier, *d_next_frontier;
+  int *d_next_frontier_size;
+
+  // We need to fetch d_compressed_col etc from graph
+  // Note: Caller must ensure copyGraphToDevice (or compress) was called
+
+  CUDA_CHECK(cudaMalloc(&d_distances, num_nodes * sizeof(level_t)));
+  CUDA_CHECK(cudaMalloc(&d_frontier, num_nodes * sizeof(node_t)));
+  CUDA_CHECK(cudaMalloc(&d_next_frontier, num_nodes * sizeof(node_t)));
+  CUDA_CHECK(cudaMalloc(&d_next_frontier_size, sizeof(int)));
+
+  CUDA_CHECK(cudaMemset(d_distances, UNVISITED, num_nodes * sizeof(level_t)));
+
+  level_t zero = 0;
+  CUDA_CHECK(cudaMemcpy(d_distances + source, &zero, sizeof(level_t),
+                        cudaMemcpyHostToDevice));
+
+  node_t h_frontier[1] = {source};
+  CUDA_CHECK(cudaMemcpy(d_frontier, h_frontier, sizeof(node_t),
+                        cudaMemcpyHostToDevice));
+
+  int frontier_size = 1;
+
+  CudaTimer timer = createTimer();
+  startTimer(&timer);
+
+  int level = 0;
+
+  while (frontier_size > 0) {
+    CUDA_CHECK(cudaMemset(d_next_frontier_size, 0, sizeof(int)));
+
+    int numBlocks = (frontier_size + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    int blockSize = WARPS_PER_BLOCK * WARP_SIZE;
+
+    bfsCompressedWarpKernel<<<numBlocks, blockSize>>>(
+        graph->d_row_Ptr, graph->d_compressed_col, d_distances, d_frontier,
+        frontier_size, d_next_frontier, d_next_frontier_size, level);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    int h_next_frontier_size;
+    CUDA_CHECK(cudaMemcpy(&h_next_frontier_size, d_next_frontier_size,
+                          sizeof(int), cudaMemcpyDeviceToHost));
+
+    frontier_size = h_next_frontier_size;
+    node_t *temp = d_frontier;
+    d_frontier = d_next_frontier;
+    d_next_frontier = temp;
+
+    level++;
+  }
+
+  float elapsed = stopTimer(&timer);
+  BFSResult *result = new BFSResult;
+  result->num_nodes = num_nodes;
+  result->source = source;
+  result->elapsed_ms = elapsed;
+  result->distances = new level_t[num_nodes];
+  CUDA_CHECK(cudaMemcpy(result->distances, d_distances,
+                        num_nodes * sizeof(level_t), cudaMemcpyDeviceToHost));
+
+  CUDA_CHECK(cudaFree(d_distances));
+  CUDA_CHECK(cudaFree(d_frontier));
+  CUDA_CHECK(cudaFree(d_next_frontier));
+  CUDA_CHECK(cudaFree(d_next_frontier_size));
+
+  return result;
+}
+
 BFSResult *bfsShared(CSRGraph *graph, BFSOptions *opts) {
   if (!graph->d_row_ptr)
     copyGraphToDevice(graph);
@@ -506,6 +586,13 @@ BFSResult *bfsShared(CSRGraph *graph, BFSOptions *opts) {
     printf("Decision: User requested AFFOREST (Connectivity).\n");
     printf("----------------------------\n");
     return solveUnionFind(graph, opts->source);
+  }
+
+  // Adaptive BFS
+  if (opts->algorithm == ALGO_ADAPTIVE) {
+    printf("Decision: User requested ADAPTIVE BFS.\n");
+    printf("----------------------------\n");
+    return solveBFSAdaptive(graph, opts->source);
   }
 
   size_t free_mem, total_mem;
@@ -524,6 +611,8 @@ BFSResult *bfsShared(CSRGraph *graph, BFSOptions *opts) {
   // Managed Memory) Friendster is ~14.5GB (Use Hybrid BFS), Mawi is ~4GB (Use
   // Hybrid BFS).
   size_t system_ram_limit = 18ULL * 1024 * 1024 * 1024;
+
+  // STANDARD BFS (Fallback)
 
   // We check if (Graph Size + BFS Buffers) < System Limit
   size_t total_est_usage =
@@ -569,7 +658,34 @@ int main(int argc, char **argv) {
   if (!opts.json_output)
     printGraphStats(graph);
 
-  copyGraphToDevice(graph);
+  // --- COMPRESSION LOGIC ---
+  CompressedCSRGraph *c_graph = nullptr;
+  if (opts.compression) {
+    if (!opts.json_output)
+      printf("Enabling Graph Compression (Host-side)... \n");
+
+    c_graph = new CompressedCSRGraph;
+    // Compressing In-Place reuses graph->h_col_idx buffer
+    if (!compressGraphInPlace(graph, c_graph)) {
+      if (!opts.json_output)
+        printf("Compression Failed! Falling back to standard BFS.\n");
+      // Clean up empty struct
+      delete c_graph;
+      c_graph = nullptr;
+      opts.compression = false;
+    } else {
+      if (!opts.json_output)
+        printf("Compression Successful. Setting up Zero-Copy...\n");
+      setupCompressedGraphDevice(c_graph);
+    }
+  }
+
+  // --- COPY TO DEVICE ---
+  // Only copy strictly if NOT compressed (or failed fallback)
+  // If compressed, setupCompressedGraphDevice already handled mapping.
+  if (!opts.compression) {
+    copyGraphToDevice(graph);
+  }
 
   // Benchmarking Loop
   int num_trials = opts.benchmark ? opts.num_runs : 1;
@@ -580,20 +696,45 @@ int main(int argc, char **argv) {
     if (final_result)
       freeBFSResult(final_result);
 
-    // We need to re-run. bfsShared handles logic.
-    // Ideally we should sync before starting timer, but bfsShared does it
-    // inside.
-    final_result = bfsShared(graph, &opts);
-    times[i] = final_result->elapsed_ms;
+    // Branch Execution
+    if (opts.compression && c_graph) {
+      if (opts.algorithm == ALGO_ADAPTIVE) {
+        final_result = solveBFSCompressedAdaptive(c_graph, opts.source);
+      } else if (opts.algorithm == ALGO_AFFOREST) {
+        solveAfforestCompressed(c_graph);
+        final_result = nullptr;
+      } else {
+        final_result = solveBFSCompressed(c_graph, opts.source);
+      }
+    } else {
+      if (opts.algorithm == ALGO_ADAPTIVE) {
+        final_result = solveBFSAdaptive(graph, opts.source);
+      } else if (opts.algorithm == ALGO_AFFOREST) {
+        solveAfforest(graph);
+        // Afforest does not return BFSResult yet, preventing double-free logic
+        // for now We set final_result to null to skip result processing logic
+        final_result = nullptr;
+      } else {
+        final_result = bfsShared(graph, &opts);
+      }
+    }
 
-    if (!opts.json_output) {
-      printf("Trial %d: %.3f ms\n", i + 1, final_result->elapsed_ms);
+    if (final_result) {
+      times[i] = final_result->elapsed_ms;
+      if (!opts.json_output) {
+        printf("Trial %d: %.3f ms\n", i + 1, final_result->elapsed_ms);
+      }
+    } else {
+      times[i] = 0.0f; // Afforest case
     }
   }
 
   // Note: For streaming detection, we'd need to modify bfsShared return
   // signature or track internally.
   bool used_streaming = false;
+  // If compressed, we used streaming (Zero-Copy) effectively
+  if (opts.compression)
+    used_streaming = true;
 
   if (opts.json_output) {
     // Compute traversed edges (reachable nodes * avg degree? No.)
@@ -607,7 +748,9 @@ int main(int argc, char **argv) {
                    graph->num_edges, times, num_trials, graph->num_edges,
                    used_streaming);
   } else {
-    printBFSResult(final_result);
+    if (final_result) {
+      printBFSResult(final_result);
+    }
     if (opts.benchmark) {
       double sum = 0;
       for (int i = 0; i < num_trials; i++)
@@ -616,13 +759,23 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (opts.validate && !opts.json_output) {
+  if (opts.validate && !opts.json_output && !opts.compression) {
     // Validate only once using final result
-    validateBFSResult(final_result, graph);
+    if (final_result) {
+      validateBFSResult(final_result, graph);
+    } else if (opts.algorithm != ALGO_AFFOREST) {
+      // Only warn if not Afforest
+    }
+  } else if (opts.compression && opts.validate && !opts.json_output &&
+             final_result) {
+    printf("Validation skipped for Compressed Graph (bfsCPU not supported).\n");
   }
 
-  freeBFSResult(final_result);
-  freeGraph(graph);
+  if (final_result)
+    freeBFSResult(final_result);
+  if (graph)
+    freeGraph(graph);
+
   delete[] times;
   return 0;
 }

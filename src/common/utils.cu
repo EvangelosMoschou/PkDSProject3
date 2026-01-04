@@ -156,6 +156,8 @@ BFSOptions parseArgs(int argc, char **argv) {
   opts.benchmark = false;
   opts.num_runs = 1;
   opts.json_output = false;
+  opts.json_output = false;
+  opts.compression = false; // Initialize explicitly
   opts.algorithm = ALGO_BFS;
 
   for (int i = 1; i < argc; i++) {
@@ -166,6 +168,8 @@ BFSOptions parseArgs(int argc, char **argv) {
         char *algo = argv[++i];
         if (strcmp(algo, "afforest") == 0) {
           opts.algorithm = ALGO_AFFOREST;
+        } else if (strcmp(algo, "adaptive") == 0) {
+          opts.algorithm = ALGO_ADAPTIVE;
         } else {
           opts.algorithm = ALGO_BFS;
         }
@@ -175,6 +179,8 @@ BFSOptions parseArgs(int argc, char **argv) {
       opts.validate = false;
     } else if (strcmp(argv[i], "--json") == 0) {
       opts.json_output = true;
+    } else if (strcmp(argv[i], "--compress") == 0) {
+      opts.compression = true;
     } else if (strcmp(argv[i], "-b") == 0 ||
                strcmp(argv[i], "--benchmark") == 0) {
       opts.benchmark = true;
@@ -206,7 +212,7 @@ void printUsage(const char *program) {
   printf("Usage: %s [options] <graph_file>\n", program);
   printf("\nOptions:\n");
   printf("  -s, --source <n>     Source node for BFS (default: 0)\n");
-  printf("  --algo <type>        Algorithm: 'bfs' (default) or 'afforest'\n");
+  printf("  --algo <type>        Algorithm: 'bfs', 'adaptive', 'afforest'\n");
   printf("  -v, --verbose        Enable verbose output\n");
   printf("  -n, --no-validate    Skip validation against CPU\n");
   printf("  -b, --benchmark <n>  Run benchmark with n iterations\n");

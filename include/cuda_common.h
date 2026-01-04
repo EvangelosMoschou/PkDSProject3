@@ -85,13 +85,6 @@ inline void printDeviceInfo() {
   printf("=======================\n\n");
 }
 
-#endif // CUDA_COMMON_H
-
-// =============================================================================
-// Device Helper Functions (must be after #endif for guard inclusion reasons)
-// Include only once in .cu files that need it
-// =============================================================================
-
 #ifdef CUDA_ATOMICS_IMPL
 // Helper for 8-bit atomic CAS (Simulates byte atomic on 32-bit word)
 __device__ inline unsigned char atomicCAS_uint8(unsigned char *address,
@@ -111,3 +104,5 @@ __device__ inline unsigned char atomicCAS_uint8(unsigned char *address,
   return (old >> shift) & 0xFF;
 }
 #endif
+
+#endif // CUDA_COMMON_H
