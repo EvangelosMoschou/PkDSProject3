@@ -33,7 +33,8 @@ results/
 # Report artifacts
 Report/Report-Example/
 *.aux
-*.pdf
+# *.pdf
+!Report/report.pdf
 *.synctex.gz
 
 # PGO artifacts

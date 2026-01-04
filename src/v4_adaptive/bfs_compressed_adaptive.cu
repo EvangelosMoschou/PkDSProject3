@@ -117,10 +117,11 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
     }
 
     if (h_count_large > 0) {
-      int warps_per_block = 8; // 256 threads / 32
+      int warps_per_block =
+          32; // 1024 threads / 32 = 32 warps (matches kernel expectation)
       int lg_blocks = (h_count_large + warps_per_block - 1) / warps_per_block;
       // Note: bfsCompressedWarpKernel assumes 1 Warp per Node in Frontier
-      bfsCompressedWarpKernel<<<lg_blocks, 256>>>(
+      bfsCompressedWarpKernel<<<lg_blocks, 1024>>>(
           graph->d_row_Ptr, graph->d_compressed_col, d_distances, d_q_large,
           h_count_large, d_next_frontier, d_next_frontier_size, level);
     }

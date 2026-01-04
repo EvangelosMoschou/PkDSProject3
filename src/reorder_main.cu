@@ -1,60 +1,71 @@
-#include "common/graph.h"
-#include "common/reorder.h"
-#include "common/utils.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+// Reorder Tool: Apply reordering and save to .csrbin
+// Usage: ./reorder_graph <input.mat|.csrbin> <output.csrbin> [method]
+//   method: 0=BFS, 1=DEGREE, 2=GAP_BFS (default)
 
-int main(int argc, char **argv) {
+#include "cuda_common.h"
+#include "graph.h"
+#include "reorder.h"
+#include <cstring>
+#include <stdio.h>
+
+int main(int argc, char *argv[]) {
   if (argc < 3) {
-    printf("Usage: %s <input_graph> <output_file> [method]\n", argv[0]);
-    printf("Methods: bfs (default), degree\n");
+    printf("Usage: %s <input_graph> <output.csrbin> [method]\n", argv[0]);
+    printf("  method: 0=BFS, 1=DEGREE, 2=GAP_BFS (default)\n");
     return 1;
   }
 
   const char *input_file = argv[1];
   const char *output_file = argv[2];
-  const char *method_str = (argc > 3) ? argv[3] : "bfs";
 
-  ReorderMethod method = REORDER_BFS;
-  if (strcmp(method_str, "degree") == 0) {
-    method = REORDER_DEGREE;
-  } else if (strcmp(method_str, "bfs") != 0) {
-    printf("Unknown method: %s\n", method_str);
-    return 1;
+  ReorderMethod method = REORDER_GAP_BFS; // Default to Gap-Aware BFS
+  if (argc >= 4) {
+    int m = atoi(argv[3]);
+    if (m == 0)
+      method = REORDER_BFS;
+    else if (m == 1)
+      method = REORDER_DEGREE;
+    else
+      method = REORDER_GAP_BFS;
   }
 
-  printf("Loading Graph: %s\n", input_file);
-  CSRGraph *graph = nullptr;
+  printf("=== Graph Reordering Tool ===\n");
+  printf("Input:  %s\n", input_file);
+  printf("Output: %s\n", output_file);
+  printf("Method: %s\n", method == REORDER_BFS      ? "Standard BFS"
+                         : method == REORDER_DEGREE ? "Degree Sort"
+                                                    : "Gap-Aware BFS");
+  printf("\n");
 
-  // Auto-detect format based on extension logic mirrored from bfs_shared
+  // Detect file type and load appropriately
+  CSRGraph *graph = nullptr;
   const char *ext = strrchr(input_file, '.');
-  if (ext && strcmp(ext, ".csrbin") == 0)
-    graph = loadGraphCSRBin(input_file);
-  else if (ext && strcmp(ext, ".mat") == 0)
+
+  if (ext && strcmp(ext, ".mat") == 0) {
+    printf("Loading HDF5 (.mat) file...\n");
     graph = loadGraphHDF5(input_file);
-  else
+  } else if (ext && strcmp(ext, ".csrbin") == 0) {
+    printf("Loading CSR binary file...\n");
+    graph = loadGraphCSRBin(input_file);
+  } else {
+    printf("Loading text edge list file...\n");
     graph = loadGraph(input_file);
+  }
 
   if (!graph) {
-    printf("Failed to load graph.\n");
+    fprintf(stderr, "Error: Failed to load graph from %s\n", input_file);
     return 1;
   }
 
-  // Perform reordering and save (Streaming)
-  CudaTimer timer = createTimer();
-  startTimer(&timer);
+  printf("\nGraph loaded: %d nodes, %lld edges\n\n", graph->num_nodes,
+         (long long)graph->num_edges);
 
-  printf("Starting Streaming Reorder...\n");
+  // Reorder and save
   reorderAndSaveStreaming(graph, output_file, method);
 
-  float elapsed = stopTimer(&timer);
-  printf("Reordering + Saving Completed in %.2f ms.\n", elapsed);
+  printf("\nReordering complete. Output saved to: %s\n", output_file);
 
-  // Cleanup Original
+  // Cleanup
   freeGraph(graph);
-
-  return 0;
-
   return 0;
 }

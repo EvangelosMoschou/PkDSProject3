@@ -59,8 +59,7 @@ __global__ void bfsThreadKernel(const node_t *__restrict__ q, int q_size,
     // Serial Neighbor Check
     for (edge_t e = start; e < end; e++) {
       node_t v = col_idx[e];
-      level_t old =
-          atomicCAS_uint8(&distances[v], UNVISITED, current_level + 1);
+      level_t old = atomicCAS(&distances[v], UNVISITED, current_level + 1);
       if (old == UNVISITED) {
         int pos = atomicAdd(next_frontier_size, 1);
         next_frontier[pos] = v;
@@ -93,8 +92,7 @@ __global__ void bfsWarpKernel(const node_t *__restrict__ q, int q_size,
     // Threads in warp iterate from start to end
     for (edge_t e = start + lane_id; e < end; e += WARP_SIZE) {
       node_t v = col_idx[e];
-      level_t old =
-          atomicCAS_uint8(&distances[v], UNVISITED, current_level + 1);
+      level_t old = atomicCAS(&distances[v], UNVISITED, current_level + 1);
       if (old == UNVISITED) {
         int pos = atomicAdd(next_frontier_size, 1);
         next_frontier[pos] = v;
@@ -124,8 +122,7 @@ __global__ void bfsBlockKernel(const node_t *__restrict__ q, int q_size,
     // Block Stride Loop
     for (edge_t e = start + tid; e < end; e += blockDim.x) {
       node_t v = col_idx[e];
-      level_t old =
-          atomicCAS_uint8(&distances[v], UNVISITED, current_level + 1);
+      level_t old = atomicCAS(&distances[v], UNVISITED, current_level + 1);
       if (old == UNVISITED) {
         int pos = atomicAdd(next_frontier_size, 1);
         next_frontier[pos] = v;

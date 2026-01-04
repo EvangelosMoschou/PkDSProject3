@@ -91,8 +91,8 @@ $(OBJ_DIR)/reorder.o: $(SRC_DIR)/common/reorder.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
 # Tools
-reorder_graph: $(COMMON_OBJS) $(OBJ_DIR)/reorder.o $(OBJ_DIR)/reorder_main.o
-	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
+reorder_graph: dirs $(COMMON_OBJS) $(OBJ_DIR)/reorder.o $(OBJ_DIR)/reorder_main.o
+	$(NVCC) $(NVCC_FLAGS) -o $(BIN_DIR)/$@ $(COMMON_OBJS) $(OBJ_DIR)/reorder.o $(OBJ_DIR)/reorder_main.o $(LDFLAGS)
 
 $(OBJ_DIR)/reorder_main.o: $(SRC_DIR)/reorder_main.cu
 	$(NVCC) $(NVCC_FLAGS) -I$(SRC_DIR)/common -c -o $@ $<
@@ -104,9 +104,11 @@ clean:
 # Help
 help:
 	@echo "Available targets:"
-	@echo "  all     - Build production version (v3)"
-	@echo "  v3      - Build v3 (Adaptive BFS + Compressed BFS + Afforest)"
-	@echo "  clean   - Remove build files"
-	@echo "  help    - Show this help message"
+	@echo "  all          - Build production version (v3)"
+	@echo "  v3           - Build v3 (Adaptive BFS + Compressed BFS + Afforest)"
+	@echo "  reorder_graph - Build graph reordering tool"
+	@echo "  clean        - Remove build files"
+	@echo "  help         - Show this help message"
 	@echo ""
 	@echo "Legacy versions (v1, v2) are archived in src/legacy/"
+
