@@ -19,6 +19,8 @@ int main(int argc, char **argv) {
   ReorderMethod method = REORDER_BFS;
   if (strcmp(method_str, "degree") == 0) {
     method = REORDER_DEGREE;
+  } else if (strcmp(method_str, "rcm") == 0) {
+    method = REORDER_RCM;
   } else if (strcmp(method_str, "bfs") != 0) {
     printf("Unknown method: %s\n", method_str);
     return 1;
@@ -46,7 +48,20 @@ int main(int argc, char **argv) {
   startTimer(&timer);
 
   printf("Starting Streaming Reorder...\n");
-  reorderAndSaveStreaming(graph, output_file, method);
+
+  char temp_output_file[256];
+  bool overwrite = false;
+
+  if (strcmp(input_file, output_file) == 0) {
+    overwrite = true;
+    snprintf(temp_output_file, sizeof(temp_output_file), "%s.tmp", output_file);
+    printf("In-Place Upgrade Detected. Writing to temp file: %s\n",
+           temp_output_file);
+  } else {
+    strncpy(temp_output_file, output_file, sizeof(temp_output_file));
+  }
+
+  reorderAndSaveStreaming(graph, temp_output_file, method);
 
   float elapsed = stopTimer(&timer);
   printf("Reordering + Saving Completed in %.2f ms.\n", elapsed);
@@ -54,7 +69,15 @@ int main(int argc, char **argv) {
   // Cleanup Original
   freeGraph(graph);
 
-  return 0;
+  if (overwrite) {
+    printf("Finalizing Upgrade: Atomic Rename %s -> %s\n", temp_output_file,
+           output_file);
+    if (rename(temp_output_file, output_file) != 0) {
+      perror("Error renaming temp file");
+      return 1;
+    }
+    printf("Success! Original file replaced with Reordered version.\n");
+  }
 
   return 0;
 }

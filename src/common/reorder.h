@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-enum ReorderMethod { REORDER_BFS, REORDER_DEGREE, REORDER_NONE };
+enum ReorderMethod { REORDER_BFS, REORDER_DEGREE, REORDER_RCM, REORDER_NONE };
 
 // Creates a new reordered graph. The caller is responsible for freeing the
 // result.
