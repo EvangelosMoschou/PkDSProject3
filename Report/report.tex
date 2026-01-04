@@ -290,16 +290,6 @@ This project successfully implemented a production-grade GPU graph processing sy
 
 The project demonstrates that \textbf{bandwidth-aware optimizations} are critical for large-scale graph processing on modern GPUs. While compute throughput continues to increase (TFLOPS), memory bandwidth remains the primary bottleneck for graph algorithms. Delta compression, streaming access patterns, and pruning strategies are essential for achieving practical performance on billion-scale datasets.
 
-\subsection{Future Work}
-
-Potential improvements include:
-\begin{itemize}
-    \item \textbf{GPU Varint Decoding}: Full warp-parallel decoding kernel
-    \item \textbf{Multi-GPU}: Distributed graph partitioning across multiple GPUs
-    \item \textbf{Community Detection}: Extend Afforest to Louvain modularity
-    \item \textbf{Dynamic Graphs}: Incremental BFS for streaming edge updates
-\end{itemize}
-
 \vfill
 \noindent\textbf{Source Code:} \url{https://github.com/EvangelosMoschou/PkDSProject3.git}
 
