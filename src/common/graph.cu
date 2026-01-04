@@ -1,3 +1,4 @@
+#include "cuda_common.h" // For cudaMallocHostntl.h> // Added by user
 #include "graph.h"
 #include "io_utils.h"
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <string> // Added by user
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -51,8 +53,10 @@ CSRGraph *loadGraph(const char *filename) {
     graph->num_edges += adj[i].size();
   }
 
-  graph->h_row_ptr = new edge_t[num_nodes + 1];
-  graph->h_col_idx = new node_t[graph->num_edges];
+  CUDA_CHECK(
+      cudaMallocHost(&graph->h_row_ptr, (num_nodes + 1) * sizeof(edge_t)));
+  CUDA_CHECK(
+      cudaMallocHost(&graph->h_col_idx, graph->num_edges * sizeof(node_t)));
 
   // Build CSR structure
   edge_t edge_idx = 0;
@@ -117,8 +121,10 @@ CSRGraph *loadGraphCSRBin(const char *filename) {
   // to handle the GPU side. Friendster edges = 1.8B * 4 bytes = 7.2 GB. System
   // RAM is 32GB, so this fits easily.
 
-  graph->h_row_ptr = new edge_t[graph->num_nodes + 1];
-  graph->h_col_idx = new node_t[graph->num_edges];
+  CUDA_CHECK(cudaMallocHost(&graph->h_row_ptr,
+                            (graph->num_nodes + 1) * sizeof(edge_t)));
+  CUDA_CHECK(
+      cudaMallocHost(&graph->h_col_idx, graph->num_edges * sizeof(node_t)));
 
   printf("Allocated Host Memory. Reading Data...\n");
 
@@ -126,8 +132,8 @@ CSRGraph *loadGraphCSRBin(const char *filename) {
                  offset) != 0) {
     fprintf(stderr, "Error reading row_ptr from %s\n", filename);
     close(fd);
-    delete[] graph->h_row_ptr;
-    delete[] graph->h_col_idx;
+    cudaFreeHost(graph->h_row_ptr);
+    cudaFreeHost(graph->h_col_idx);
     delete graph;
     return nullptr;
   }
@@ -160,8 +166,11 @@ void saveGraphCSRBin(const CSRGraph *graph, const char *filename) {
   }
 
   // Write header
-  fwrite(&graph->num_nodes, sizeof(node_t), 1, file);
-  fwrite(&graph->num_edges, sizeof(edge_t), 1, file);
+  // Write header (8 bytes each to match loadGraphCSRBin)
+  unsigned long long n = (unsigned long long)graph->num_nodes;
+  unsigned long long m = (unsigned long long)graph->num_edges;
+  fwrite(&n, sizeof(unsigned long long), 1, file);
+  fwrite(&m, sizeof(unsigned long long), 1, file);
 
   // Write arrays
   fwrite(graph->h_row_ptr, sizeof(edge_t), graph->num_nodes + 1, file);
@@ -240,8 +249,9 @@ CSRGraph *loadGraphHDF5(const char *filename) {
       (double)((num_nodes + 1) * sizeof(edge_t) + num_edges * sizeof(node_t)) /
           1024.0 / 1024.0 / 1024.0);
 
-  graph->h_row_ptr = new edge_t[num_nodes + 1];
-  graph->h_col_idx = new node_t[num_edges];
+  CUDA_CHECK(
+      cudaMallocHost(&graph->h_row_ptr, (num_nodes + 1) * sizeof(edge_t)));
+  CUDA_CHECK(cudaMallocHost(&graph->h_col_idx, num_edges * sizeof(node_t)));
 
   // READ DATA
   // Assumption: Symmetric Graph (CSC == CSR)
@@ -372,8 +382,9 @@ void copyGraphToDevice(CSRGraph *graph) {
            col_idx_size / (1024.0 * 1024.0 * 1024.0));
 
     // 1. Register Host Memory as Mapped (Device Accessible)
-    CUDA_CHECK(cudaHostRegister(graph->h_col_idx, col_idx_size,
-                                cudaHostRegisterMapped));
+    // ALREADY PINNED via cudaMallocHost.
+    // CUDA_CHECK(cudaHostRegister(graph->h_col_idx, col_idx_size,
+    // cudaHostRegisterMapped));
     // 2. Get Device Pointer
     CUDA_CHECK(cudaHostGetDevicePointer((void **)&graph->d_col_idx,
                                         (void *)graph->h_col_idx, 0));
@@ -420,14 +431,58 @@ void freeGraphDevice(CSRGraph *graph) {
   }
 }
 
+void setupCompressedGraphDevice(CompressedCSRGraph *graph) {
+  // We assume h_row_Ptr and h_compressed_col are already PINNED
+  // (allocated via cudaMallocHost in compressGraph).
+
+  // 1. Get Device Pointer for Row Pointers
+  // Note: cudaMallocHost memory is technically accessible, but getDevicePointer
+  // is safer for strict ZC. Actually, cudaMallocHost returns a pointer valid on
+  // both if portable? Standard practice: check definition. Let's rely on
+  // cudaHostGetDevicePointer to be sure.
+
+  CUDA_CHECK(cudaHostGetDevicePointer((void **)&graph->d_row_Ptr,
+                                      (void *)graph->h_row_Ptr, 0));
+
+  // 2. Get Device Pointer for Compressed Data
+  // This buffer was reused from input->h_col_idx (pinned) or allocated new
+  // pinned. If it was reused from input graph which was registered? If
+  // compressGraphInPlace reused it, it's pinned. We need to ensure it's mapped.
+  // cudaHostRegister might be needed if it wasn't mapped?
+  // Since compressGraphInPlace reuses the buffer from loadGraph, and loadGraph
+  // uses cudaMallocHost... cudaMallocHost memory is implicitly mapped on many
+  // systems, but let's explicit register if needed? Error: cannot register
+  // already registered memory. Safe bet: Just get device pointer.
+
+  CUDA_CHECK(cudaHostGetDevicePointer((void **)&graph->d_compressed_col,
+                                      (void *)graph->h_compressed_col, 0));
+
+  printf("Compressed Graph Mapped to Device (Zero-Copy).\n");
+
+  // Prefetch/Advise
+  // int deviceId = 0;
+  // Compress rows are accessed randomly, so ReadMostly is good.
+  // Note: cudaMemAdvise fails on Pinned Host Memory (Zero-Copy) if not Managed.
+  /*
+  CUDA_CHECK(cudaMemAdvise(graph->d_row_Ptr,
+                           (graph->num_nodes + 1) * sizeof(edge_t),
+                           cudaMemAdviseSetReadMostly, deviceId));
+  // Compressed data is accessed sequentially-ish (by warp), but effectively
+  // random access.
+  CUDA_CHECK(cudaMemAdvise(graph->d_compressed_col,
+                           graph->compressed_size_bytes,
+                           cudaMemAdviseSetReadMostly, deviceId));
+  */
+}
+
 void freeGraph(CSRGraph *graph) {
-  if (!graph)
-    return;
 
   freeGraphDevice(graph);
 
-  delete[] graph->h_row_ptr;
-  delete[] graph->h_col_idx;
+  if (graph->h_row_ptr)
+    CUDA_CHECK(cudaFreeHost(graph->h_row_ptr));
+  if (graph->h_col_idx)
+    CUDA_CHECK(cudaFreeHost(graph->h_col_idx));
   delete graph;
 }
 

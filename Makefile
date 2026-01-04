@@ -27,16 +27,18 @@ NVCC_FLAGS += -I$(INC_DIR) -I$(SRC_DIR)/common $(HDF5_INC)
 LDFLAGS = -L/usr/local/cuda/lib64 -lcudart $(HDF5_LIB)
 
 # Source files
-COMMON_SRCS = $(SRC_DIR)/common/graph.cu $(SRC_DIR)/common/utils.cu $(SRC_DIR)/common/json_gpu.cu $(SRC_DIR)/common/io_utils.cu
+COMMON_SRCS = $(SRC_DIR)/common/graph.cu $(SRC_DIR)/common/utils.cu $(SRC_DIR)/common/json_gpu.cu $(SRC_DIR)/common/io_utils.cu $(SRC_DIR)/common/compression.cu
 V1_SRCS = $(SRC_DIR)/v1_dynamic/bfs_dynamic.cu
 V2_SRCS = $(SRC_DIR)/v2_chunked/bfs_chunked.cu
-V3_SRCS = $(SRC_DIR)/v3_shared/bfs_shared.cu
+V3_SRCS = $(SRC_DIR)/v3_shared/bfs_shared.cu $(SRC_DIR)/v4_adaptive/bfs_adaptive.cu
 
 # Object files
-COMMON_OBJS = $(OBJ_DIR)/graph.o $(OBJ_DIR)/utils.o $(OBJ_DIR)/json_gpu.o $(OBJ_DIR)/io_utils.o
+COMMON_OBJS = $(OBJ_DIR)/graph.o $(OBJ_DIR)/utils.o $(OBJ_DIR)/json_gpu.o $(OBJ_DIR)/io_utils.o $(OBJ_DIR)/compression.o
 V1_OBJS = $(OBJ_DIR)/bfs_dynamic.o
 V2_OBJS = $(OBJ_DIR)/bfs_chunked.o
-V3_OBJS = $(OBJ_DIR)/bfs_shared.o
+V3_OBJS = $(OBJ_DIR)/bfs_shared.o $(OBJ_DIR)/bfs_adaptive.o \
+          $(OBJ_DIR)/bfs_compressed_kernels.o $(OBJ_DIR)/bfs_compressed_adaptive.o \
+          $(OBJ_DIR)/afforest.o
 
 # Executables
 V1_BIN = $(BIN_DIR)/bfs_v1
@@ -81,6 +83,18 @@ $(V3_BIN): $(COMMON_OBJS) $(V3_OBJS)
 $(OBJ_DIR)/bfs_shared.o: $(V3_SRCS)
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
+$(OBJ_DIR)/bfs_adaptive.o: $(SRC_DIR)/v4_adaptive/bfs_adaptive.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/bfs_compressed_kernels.o: $(SRC_DIR)/v3_shared/bfs_compressed_kernels.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/bfs_compressed_adaptive.o: $(SRC_DIR)/v4_adaptive/bfs_compressed_adaptive.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/afforest.o: $(SRC_DIR)/v4_adaptive/afforest.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
 # Common objects
 $(OBJ_DIR)/graph.o: $(SRC_DIR)/common/graph.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
@@ -93,6 +107,19 @@ $(OBJ_DIR)/json_gpu.o: $(SRC_DIR)/common/json_gpu.cu
 
 $(OBJ_DIR)/io_utils.o: $(SRC_DIR)/common/io_utils.cu
 	$(NVCC) $(NVCC_FLAGS) -x cu -c -o $@ $<
+
+$(OBJ_DIR)/compression.o: $(SRC_DIR)/common/compression.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/reorder.o: $(SRC_DIR)/common/reorder.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
+# Tools
+reorder_graph: $(COMMON_OBJS) $(OBJ_DIR)/reorder.o $(OBJ_DIR)/reorder_main.o
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
+
+$(OBJ_DIR)/reorder_main.o: $(SRC_DIR)/reorder_main.cu
+	$(NVCC) $(NVCC_FLAGS) -I$(SRC_DIR)/common -c -o $@ $<
 
 # Clean
 clean:

@@ -4,6 +4,9 @@ bin/
 *.o
 *.out
 *.exe
+bfs_c_csr
+reorder_graph
+bfs_v3
 
 # Large Data Files
 Mat Files/*

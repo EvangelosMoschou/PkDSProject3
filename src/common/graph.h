@@ -2,6 +2,7 @@
 #define GRAPH_H
 
 #include "cuda_common.h"
+#include <cstdint>
 
 // =============================================================================
 // CSR Graph Structure
@@ -32,6 +33,27 @@ typedef struct {
   edge_t *d_row_ptr; // Row pointers on GPU
   node_t *d_col_idx; // Column indices on GPU
 } CSRGraph;
+
+/**
+ * Delta-Compressed CSR Graph (c-CSR)
+ * Optimized for PCIe-constrained scenarios (Zero-Copy streaming).
+ *
+ * - row_ptr: Points to BYTE OFFSETS in compressed_col_idx (not index counts)
+ * - compressed_col_idx: Varint-encoded delta sequence of neighbors
+ */
+typedef struct {
+  node_t num_nodes;
+  edge_t num_edges;
+  size_t compressed_size_bytes;
+
+  // Host Arrays
+  edge_t *h_row_Ptr;         // [num_nodes + 1] (Byte offsets)
+  uint8_t *h_compressed_col; // [compressed_size_bytes]
+
+  // Device Arrays (Zero-Copy Mapped)
+  edge_t *d_row_Ptr;         // Device pointer to row_ptr
+  uint8_t *d_compressed_col; // Device pointer to compressed data
+} CompressedCSRGraph;
 
 // =============================================================================
 // Graph I/O Functions
@@ -72,6 +94,17 @@ CSRGraph *generateRandomGraph(node_t num_nodes, edge_t avg_degree);
  * Allocate and copy graph data to GPU
  */
 void copyGraphToDevice(CSRGraph *graph);
+
+/**
+ * Setup Zero-Copy mapping for Compressed CSR Graph
+ */
+void setupZeroCopyCompressed(CompressedCSRGraph *graph);
+
+/**
+ * Free CSR Graph resources (host and device)
+ */
+void freeGraph(CSRGraph *graph);
+void setupCompressedGraphDevice(CompressedCSRGraph *graph);
 
 /**
  * Free GPU graph memory
