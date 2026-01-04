@@ -12,7 +12,9 @@
 \usepackage[utf8]{inputenc}
 
 \usepackage{geometry}
-\geometry{margin=2cm}
+\geometry{left=1.5cm,right=1.5cm,top=2cm,bottom=2cm}
+\usepackage{enumitem}
+\setlist{nosep}
 
 \usepackage{graphicx}
 \usepackage{booktabs}
@@ -67,102 +69,22 @@ We evaluate several preprocessing and optimization strategies:
 Our experimental results reveal a key insight: \textbf{Standard RCM and compression are antagonistic}, but \textbf{Gap-Aware BFS resolves this trade-off}. While RCM improves cache locality for uncompressed algorithms, it scatters IDs and ruins compression. In contrast, Gap-Aware BFS achieves the spatial locality of RCM while maintaining the small deltas required for efficient Varint encoding.
 
 % ------------------------------------------------------------------------------
-% Section 2: Algorithm Design
+% Section 2: Algorithm & Data Structure Design
 % ------------------------------------------------------------------------------
-\section{Algorithm Design}
+\section{Algorithm \& Data Structure Design}
 
-\subsection{Graph Representation}
-
-\paragraph{Standard CSR.}
-The CSR format consists of two arrays: \texttt{row\_ptr[n+1]} defining adjacency list boundaries and \texttt{col\_idx[m]} storing neighbor indices. This representation is ideal for GPU parallelism as it allows coalesced memory access patterns.
-
-\paragraph{Compressed CSR (c-CSR).}
-To reduce memory bandwidth, we implement Delta+Varint compression:
-\begin{enumerate}
-    \item Sort neighbors per row: $[5, 12, 8, 20] \rightarrow [5, 8, 12, 20]$
-    \item Compute deltas: $\Delta = [5, 3, 4, 8]$  
-    \item Varint encode: Small deltas use 1 byte, large deltas use up to 5 bytes
-\end{enumerate}
-
-The \texttt{row\_ptr} array now stores \textbf{byte offsets} instead of edge indices, and \texttt{compressed\_col} is a byte stream requiring on-the-fly decoding.
-
-\subsection{Adaptive BFS}
-
-The Adaptive BFS kernel dynamically classifies frontier nodes based on degree:
+\subsection{Data Representation: Compressed CSR \& Zero-Copy}
+Standard CSR allows coalesced GPU access but bottlenecks PCIe bandwidth (~13.5GB for Friendster vs 5.8GB VRAM). We implement **Zero-Copy Streaming** combined with **Delta-Varint Compression**:
 \begin{itemize}
-    \item \textbf{Small degree} ($<$ threshold): Process sequentially per thread
-    \item \textbf{Large degree} ($\geq$ threshold): Cooperative warp processing
+    \item \textbf{Delta+Varint}: Neighbors are sorted, and differences ($\Delta$) are stored using variable-length integers (1-5 bytes). This reduces Friendster from 14.4GB to 9.1GB (37\% reduction).
+    \item \textbf{Streaming}: We use \texttt{cudaHostRegister} to pin host memory, allowing kernels to access data directly over PCIe (effective bw $\sim$1.4GB/s).
+    \item \textbf{Decoding}: A warp-cooperative kernel decodes byte-streams in shared memory. Lane 0 decodes sequentially; all lanes process neighbors in parallel.
 \end{itemize}
 
-This classification reduces warp divergence and balances load across threads. The kernel uses shared memory for cooperative neighbor expansion and ballot sync for efficient atomic reduction.
+\subsection{Adaptive BFS \& Afforest}
+\textbf{Adaptive BFS} classifies nodes by degree: high-degree nodes use cooperative warp expansion to balance load, while low-degree nodes are processed per-thread. The compressed variant integrates on-the-fly decoding, masking $\sim$400ns PCIe latency with compute.
 
-\subsection{Compressed BFS}
-
-The compressed BFS kernel employs a warp-cooperative strategy to decode Varint-encoded neighbors efficiently. Each warp (32 threads) processes one frontier node cooperatively. Lane 0 performs serial delta decoding: it reads the compressed byte stream, decodes each Varint to recover delta values, reconstructs absolute neighbor IDs by accumulating deltas, and stores results in shared memory. After synchronization via warp barrier, all 32 lanes process the decoded neighbors in parallel using a strided loop pattern (lane $i$ processes neighbors $i, i+32, i+64, \ldots$).
-
-This design balances the inherently serial nature of delta decoding (each neighbor depends on the previous) with parallel neighbor processing. The use of shared memory (48KB per SM) allows fast broadcast of decoded data to all warp lanes. For high-degree nodes, the kernel processes neighbors in chunks of 32, maximizing occupancy while minimizing shared memory pressure.
-
-\textbf{Varint Decoding Details:} Each integer is encoded as 1-5 bytes. The decoder reads bytes sequentially, extracting 7-bit payloads and checking the continuation bit (bit 7). Small deltas (common in sorted neighbor lists) use only 1 byte, while large deltas use up to 5 bytes. This variable-length encoding achieves 30-40\% compression on real-world graphs with power-law degree distributions.
-
-\textbf{Bandwidth Optimization:} By streaming compressed data over PCIe, we reduce the effective bandwidth requirement from 14.4GB to 9.1GB per full graph traversal. The decoding overhead (7-10 cycles per Varint) is partially masked by PCIe latency ($\sim$400ns), making this approach highly effective for bandwidth-bound workloads.
-
-\subsection{Afforest Algorithm}
-
-Afforest is a GPU-optimized Union-Find algorithm for connected components:
-
-\paragraph{Algorithm Phases.}
-\begin{enumerate}
-    \item \textbf{Init}: Each node is its own parent: $parent[i] = i$
-    \item \textbf{Link}: For each edge $(u, v)$: $parent[\max(comp_u, comp_v)] = \min(comp_u, comp_v)$
-    \item \textbf{Compress}: Path compression: $parent[i] = parent[parent[i]]$
-\end{enumerate}
-
-\paragraph{GCC Pruning Optimization.}
-For graphs with a Giant Connected Component (GCC) containing the majority of nodes, we implement an early-exit optimization. Before processing each edge $(u,v)$, the kernel performs path compression on both endpoints to find their current component roots $comp_u$ and $comp_v$. If both roots equal the pre-identified GCC ID (heuristically set to $parent[0]$ after initialization), the edge is skipped entirely.
-
-This optimization is particularly effective on real-world graphs like Friendster where $>99.9\%$ of nodes belong to a single giant component. By converting expensive atomic minimum operations (which require cache coherence traffic and potential retry loops) into cheap read-only comparisons, we reduce memory contention significantly. The pruning check adds negligible overhead (2 integer comparisons) while eliminating atomic writes for the vast majority of edges in later iterations.
-
-\textbf{Performance Impact:} On Friendster, approximately 3.5 billion out of 3.6 billion edges connect nodes within the GCC. Without pruning, each edge triggers an atomic operation even when both endpoints are already merged. With pruning, these become no-ops, reducing atomic contention by $\sim$97\%. However, the bandwidth bottleneck (reading compressed edge data) remains, limiting the overall speedup to $\sim$9\% (21.6s vs 23.5s).
-
-\paragraph{Single-Pass Strategy.}
-Unlike traditional Afforest which requires convergence checking (2-3 passes), our optimized version runs a single pass, which is sufficient for graphs with small diameter. This reduces runtime from $\sim$46s to $\sim$21s on Friendster.
-
-% ------------------------------------------------------------------------------
-% Section 3: Memory Management
-% ------------------------------------------------------------------------------
-\section{Memory Management for Large Graphs}
-
-\subsection{Zero-Copy Strategy}
-
-For graphs exceeding GPU VRAM (Friendster: 13.5GB edge data on 5.8GB GPU), we employ CUDA's Zero-Copy mechanism with pinned host memory. The implementation follows a three-step process:
-
-\textbf{Step 1: Memory Pinning.} We register the host-allocated edge array with \texttt{cudaHostRegister(..., cudaHostRegisterMapped)}, which locks the physical pages in RAM and creates a device-accessible mapping. This prevents the OS from swapping pages and enables direct GPU access via PCIe.
-
-\textbf{Step 2: Device Pointer Acquisition.} Using \texttt{cudaHostGetDevicePointer()}, we obtain a GPU-side pointer to the pinned host memory. This pointer is valid in device code and transparently routes memory accesses through the PCIe bus.
-
-\textbf{Step 3: Kernel Execution.} GPU kernels access the edge array as if it were in VRAM. The CUDA driver automatically handles PCIe transfers, fetching cache lines on-demand. Coalesced memory access patterns (threads in a warp accessing consecutive addresses) are crucial for achieving reasonable bandwidth.
-
-\textbf{Memory Advise Hints:} We use \texttt{cudaMemAdvise(..., cudaMemAdviseSetReadMostly)} to inform the driver that the graph structure is read-only, enabling optimizations like caching in GPU L2 without write-back overhead. Additionally, \texttt{cudaMemPrefetchAsync()} can pre-load frequently accessed data (e.g., row pointers) into GPU memory before kernel launch.
-
-\textbf{Performance Characteristics:}
-\begin{itemize}
-    \item PCIe 4.0 bandwidth: $\sim$16 GB/s theoretical, $\sim$12 GB/s effective
-    \item Zero-copy latency: Higher than VRAM ($\sim$400ns vs $\sim$100ns)
-    \item Bandwidth-bound: Performance limited by data transfer rate, not compute
-\end{itemize}
-
-Our streaming access patterns achieve $\sim$0.7 GB/s effective bandwidth on the RTX 3060 Laptop GPU.
-
-\subsection{Compression Benefits}
-
-Delta-Varint compression provides:
-\begin{itemize}
-    \item \textbf{Bandwidth Reduction}: 14.4 GB $\rightarrow$ 9.1 GB (37\% reduction)
-    \item \textbf{Lower PCIe Traffic}: Fewer bytes transferred per traversal
-    \item \textbf{Decoding Overhead}: Partially masked by memory latency
-\end{itemize}
-
-The net effect is a $\sim$9\% speedup for Afforest (21.6s vs 23.5s) and $\sim$2.6x for BFS (4.5s vs 12s).
+\textbf{Afforest} (Connected Components) is optimized for single-pass execution on small-diameter graphs. We added a **GCC Pruning** heuristic: before atomic linking, we check if both nodes already belong to the Giant Connected Component (root node 0). heuristic checks reduce atomic contention by 97\% on Friendster, though the algorithm remains bandwidth-bound ($\sim$21s).
 
 % ------------------------------------------------------------------------------
 % Section 4: Results
@@ -227,27 +149,7 @@ Correctness & 100\% (verified) & 1 component (correct) \\
 \end{table}
 
 \subsection{Analysis}
-
-The 37\% data reduction translates to different speedups for BFS (1.9x) vs Afforest (1.09x). BFS benefits more because:
-\begin{itemize}
-    \item BFS performs a single pass with higher streaming density per frontier layer.
-    \item Afforest's atomic operations (component merging) partially mask bandwidth gains.
-    \item Gap-Aware BFS further improves L2 cache utilization by ~9\% over original crawl order.
-\end{itemize}
-
-\textbf{Zero-Copy Performance:}
-Despite accessing 9-14 GB of data over PCIe, both algorithms achieve practical runtimes. The key is \textbf{sequential streaming}: coalesced reads from the GPU exploit PCIe burst transfers effectively.
-
-\textbf{GCC Pruning Impact:}
-For Afforest, the GCC pruning optimization provides marginal $(< 10\%)$ benefit on Friendster because:
-\begin{itemize}
-    \item Pruning converts atomic writes to reads, but both operations traverse the same edges
-    \item The bandwidth bottleneck (reading compressed data) is not eliminated
-    \item Primary benefit: Reduced atomic contention on highly connected components
-\end{itemize}
-
-\textbf{Single-Pass vs Multi-Pass:}
-Using a single-pass Afforest reduces runtime from 46s (convergence loop) to 21.6s. This works because Friendster has diameter 22: one full edge scan connects $>99.9\%$ of the graph.
+The 37\% data reduction translates to a \textbf{1.9x speedup for BFS} vs 1.09x for Afforest. BFS benefits more due to higher streaming density per frontier layer. Afforest's heavy atomic contention partially masks bandwidth gains, though GCC pruning helps. Both algorithms effectively hide the 400ns PCIe latency through massive thread-level parallelism.
 
 % ------------------------------------------------------------------------------
 % Section 5: Graph Preprocessing: RCM and Gap-Aware BFS
