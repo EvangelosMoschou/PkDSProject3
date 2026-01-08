@@ -44,8 +44,8 @@ __global__ void bfsCompressedThreadKernel(
       prev_neighbor = neighbor;
 
       // 3. Visit Neighbor
-      level_t old = atomicCAS_uint8(&distances[neighbor], UNVISITED,
-                                    (unsigned char)(current_level + 1));
+      level_t old =
+          atomicCAS(&distances[neighbor], UNVISITED, current_level + 1);
       if (old == UNVISITED) {
         int pos = atomicAdd(next_frontier_size, 1);
         next_frontier[pos] = neighbor;
@@ -126,9 +126,9 @@ __global__ void bfsCompressedWarpKernel(
         if (lane_id < neighbors_count) {
           neighbor = s_neighbors[warp_id][lane_id];
 
-          // FIX: Use 8-bit Atomic CAS
-          level_t old_val = atomicCAS_uint8(&distances[neighbor], UNVISITED,
-                                            (unsigned char)(current_level + 1));
+          // FIX: Use 32-bit Atomic CAS
+          level_t old_val =
+              atomicCAS(&distances[neighbor], UNVISITED, current_level + 1);
           if (old_val == UNVISITED) {
             found = true;
           }

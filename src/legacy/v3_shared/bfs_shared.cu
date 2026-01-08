@@ -11,37 +11,14 @@
 // =============================================================================
 
 #define WARPS_PER_BLOCK 8
-#define SHARED_NEIGHBORS_PER_WARP 64
+// FIX: SHARED_NEIGHBORS_PER_WARP was 64 but warps only have 32 threads!
+// This caused half the neighbors to be skipped, resulting in ~50% reachability.
+#define SHARED_NEIGHBORS_PER_WARP WARP_SIZE // Must equal warp size (32)
 
 // =============================================================================
 // Kernels: BFS (Breadth-First Search)
 // =============================================================================
 
-// Helper for 8-bit atomic CAS (Simulates byte atomic on 32-bit word)
-__device__ unsigned char atomicCAS_uint8(unsigned char *address,
-                                         unsigned char compare,
-                                         unsigned char val) {
-  // Align to 4-byte boundary
-  unsigned int *base_address = (unsigned int *)((size_t)address & ~3);
-  // Calculate offset in bits (little endian)
-  unsigned int offset = ((size_t)address & 3) * 8;
-  unsigned int mask = 0xFF << offset;
-  unsigned int old = *base_address;
-  unsigned int assumed;
-
-  do {
-    assumed = old;
-    // Check if byte matches 'compare'
-    if (((old >> offset) & 0xFF) != compare)
-      return (old >> offset) & 0xFF;
-
-    // Update byte in word
-    unsigned int new_val = (old & ~mask) | ((unsigned int)val << offset);
-    old = atomicCAS(base_address, assumed, new_val);
-  } while (assumed != old);
-
-  return (old >> offset) & 0xFF;
-}
 
 __global__ void bfsWarpKernel(
     const edge_t *__restrict__ row_ptr, const node_t *__restrict__ col_idx,
@@ -78,12 +55,11 @@ __global__ void bfsWarpKernel(
       if (lane_id < chunk_size) {
         neighbor = s_neighbors[warp_id][lane_id];
 
-        // Ensure safe atomic update for uint8_t
-        // We only update if neighbor is UNVISITED
-        // If successful, returns the OLD value (UNVISITED)
-        unsigned char old_val =
-            atomicCAS_uint8(&distances[neighbor], (level_t)UNVISITED,
-                            (level_t)(current_level + 1));
+        // Optimization: Use native 32-bit atomics (Hardware Supported)
+        // Returns old value. If old value was UNVISITED, we successfully
+        // claimed it.
+        level_t old_val = atomicCAS(&distances[neighbor], (level_t)UNVISITED,
+                                    (level_t)(current_level + 1));
 
         if (old_val == UNVISITED) {
           found = true;
@@ -177,96 +153,6 @@ __global__ void connectivityToDistanceKernel(const node_t *__restrict__ parent,
 // =============================================================================
 // Internal Solver Implementations
 // =============================================================================
-
-// SOTA Node-Aligned Streamed Kernel
-// - Inputs: Buffers of Edges for a specific Node Range.
-// - Logic: Iterates over NODES (global_node_offset + tid).
-// - Fetch: Reads edge range from row_ptr (O(1)).
-// - Stream: Reads edges from col_buffer (Sequential in VRAM).
-// - Optimization: Eliminates Binary Search.
-__global__ void bfsNodeAlignedStreamedKernel(
-    const node_t *__restrict__ col_buffer, int num_nodes_in_chunk,
-    node_t global_node_offset, edge_t global_edge_offset,
-    const edge_t *__restrict__ row_ptr,
-    const unsigned int *__restrict__ frontier_bitmap,
-    level_t *__restrict__ distances, const level_t current_level,
-    int *__restrict__ next_frontier_size) {
-
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < num_nodes_in_chunk) {
-    node_t u = global_node_offset + tid;
-
-    // Check if Source u is in Frontier
-    // If u is NOT in frontier, we skip all its edges (Massive Savings)
-    if ((frontier_bitmap[u / 32] >> (u % 32)) & 1) {
-
-      // Get Edge Range for u
-      edge_t start = row_ptr[u];
-      edge_t end = row_ptr[u + 1];
-
-      // Map to Buffer Index
-      // The buffer starts at global_edge_offset
-      edge_t buffer_start = start - global_edge_offset;
-      edge_t buffer_end = end - global_edge_offset;
-
-      // Iterate Neighbors
-      for (edge_t i = buffer_start; i < buffer_end; i++) {
-        node_t v = col_buffer[i];
-
-        if (distances[v] == UNVISITED) {
-          atomicCAS_uint8(&distances[v], (level_t)UNVISITED,
-                          (level_t)(current_level + 1));
-        }
-      }
-    }
-  }
-}
-
-// Bottom-Up BFS Kernel
-// - Scans unvisited nodes linearly (streamed access).
-// - Checks incoming edges for any neighbor in the frontier.
-// - Reduces random access thrashing on large frontiers.
-__global__ void
-bfsBottomUpKernel(const edge_t *__restrict__ row_ptr,
-                  const node_t *__restrict__ col_idx,
-                  level_t *__restrict__ distances,
-                  const unsigned int *__restrict__ frontier_bitmap,
-                  const unsigned int *__restrict__ visited_bitmap,
-                  int *__restrict__ next_frontier_size,
-                  const level_t current_level, node_t num_nodes) {
-
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < num_nodes) {
-    // Check visited bitmap first (1 bit read vs 1 byte read)
-    // Optimization: Reduces bandwidth for the massive scan of unvisited nodes
-    bool visited = (visited_bitmap[tid / 32] >> (tid % 32)) & 1;
-
-    if (!visited) {
-      edge_t start = row_ptr[tid];
-      edge_t end = row_ptr[tid + 1];
-      bool found = false;
-
-      // Check if any neighbor is in the frontier
-      for (edge_t e = start; e < end; e++) {
-        node_t neighbor = col_idx[e];
-        // Check bitmap (random access but smaller and cacheable)
-        if ((frontier_bitmap[neighbor / 32] >> (neighbor % 32)) & 1) {
-          found = true;
-          break;
-        }
-      }
-
-      if (found) {
-        distances[tid] = current_level + 1;
-        // Note: We don't verify if we atomically added to queue in Bottom-Up
-        // usually, we rebuild it or use bitmap for next step. Hybrid approach:
-        // We can't easily append to queue safely/efficiently here without
-        // atomics. Simple hybrid: We will rebuild queue next step if needed or
-        // continue Bottom-Up.
-      }
-    }
-  }
-}
 
 // Optimization B: Warp-Cooperative Bottom-Up Kernel
 // - Warps load row_ptr cooperatively and scan adjacency lists together.
@@ -362,7 +248,7 @@ __global__ void distancesToQueueKernel(const level_t *__restrict__ distances,
   }
 }
 
-BFSResult *solveBFS(CSRGraph *graph, node_t source, bool use_streaming) {
+BFSResult *solveBFS(CSRGraph *graph, node_t source) {
   node_t num_nodes = graph->num_nodes;
   level_t *d_distances;
   node_t *d_frontier, *d_next_frontier;
@@ -395,21 +281,10 @@ BFSResult *solveBFS(CSRGraph *graph, node_t source, bool use_streaming) {
   CudaTimer timer = createTimer();
   startTimer(&timer);
 
-  // SOTA Streaming Setup
-  // Use 2 Streams and 2 Buffers for Double Buffering
-  // Chunk Size: 250M elements * 4B = 1GB. Two buffers = 2GB VRAM.
-  int chunkSize = 250000000;
-  node_t *d_col_buffers[2] = {nullptr, nullptr};
-  cudaStream_t streams[2];
-
-  CUDA_CHECK(cudaStreamCreate(&streams[0]));
-  CUDA_CHECK(cudaStreamCreate(&streams[1]));
-  CUDA_CHECK(cudaMalloc(&d_col_buffers[0], chunkSize * sizeof(node_t)));
-  CUDA_CHECK(cudaMalloc(&d_col_buffers[1], chunkSize * sizeof(node_t)));
-
   int level = 0;
   // Heuristic: Switch to Bottom-Up if frontier > 1/20th of nodes
-  int heavy_threshold = num_nodes / 20;
+  // FIX: Disable Bottom-Up for Directed Graphs (correctness)
+  int heavy_threshold = num_nodes + 1;
 
   while (frontier_size > 0) {
     CUDA_CHECK(cudaMemset(d_next_frontier_size, 0, sizeof(int)));
@@ -423,81 +298,20 @@ BFSResult *solveBFS(CSRGraph *graph, node_t source, bool use_streaming) {
                                                      d_frontier_bitmap);
       CUDA_CHECK(cudaDeviceSynchronize()); // Ensure Bitmap is ready
 
-      if (use_streaming) {
-        // --- SOTA NODE-ALIGNED ASYNC STREAMING PHASE ---
-        node_t current_node = 0;
-        int stream_idx = 0;
+      // --- STANDARD BOTTOM-UP PHASE (In-Core) ---
+      // Pre-step: Build Visited Bitmap
+      int numBlocksVisited = (num_nodes + 1023) / 1024;
+      clearBitmapKernel<<<(bitmap_ints + 1023) / 1024, 1024>>>(d_visited_bitmap,
+                                                               bitmap_ints);
+      generateVisitedBitmapKernel<<<numBlocksVisited, 1024>>>(
+          d_distances, d_visited_bitmap, num_nodes);
+      CUDA_CHECK(cudaDeviceSynchronize());
 
-        while (current_node < num_nodes) {
-          int cur = stream_idx % 2;
-
-          // 1. Determine Chunk Size (Greedy Node Splitting)
-          node_t start_node = current_node;
-          node_t end_node = num_nodes;
-          edge_t start_edge = graph->h_row_ptr[start_node];
-          edge_t target_edge = start_edge + chunkSize;
-          if (target_edge > graph->num_edges)
-            target_edge = graph->num_edges;
-
-          // Binary Search on Host RowPtr to find split node
-          node_t low = start_node;
-          node_t high = num_nodes;
-          node_t found_node = start_node;
-
-          while (low <= high) {
-            node_t mid = low + (high - low) / 2;
-            if (graph->h_row_ptr[mid] <= target_edge) {
-              found_node = mid;
-              low = mid + 1;
-            } else {
-              high = mid - 1;
-            }
-          }
-          end_node = found_node;
-          if (end_node == start_node && start_node < num_nodes)
-            end_node++; // Ensure progress
-
-          edge_t end_edge = graph->h_row_ptr[end_node];
-          edge_t count = end_edge - start_edge;
-          node_t num_nodes_in_chunk = end_node - start_node;
-
-          // 2. Async Copy Edges for this NodeRange
-          if (count > 0) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                d_col_buffers[cur], &graph->h_col_idx[start_edge],
-                count * sizeof(node_t), cudaMemcpyHostToDevice, streams[cur]));
-          }
-
-          // 3. Launch Node-Aligned Kernel
-          int numBlocks = (num_nodes_in_chunk + 1023) / 1024;
-          if (numBlocks > 0) {
-            bfsNodeAlignedStreamedKernel<<<numBlocks, 1024, 0, streams[cur]>>>(
-                d_col_buffers[cur], num_nodes_in_chunk, start_node,
-                start_edge,       // Global Edge Offset to subtract
-                graph->d_row_ptr, // accessing d_row_ptr is fast (in VRAM)
-                d_frontier_bitmap, d_distances, level, d_next_frontier_size);
-          }
-
-          current_node = end_node;
-          stream_idx++;
-        }
-        CUDA_CHECK(cudaDeviceSynchronize()); // Wait for all streams
-      } else {
-        // --- STANDARD BOTTOM-UP PHASE (In-Core) ---
-        // Pre-step: Build Visited Bitmap
-        int numBlocksVisited = (num_nodes + 1023) / 1024;
-        clearBitmapKernel<<<(bitmap_ints + 1023) / 1024, 1024>>>(
-            d_visited_bitmap, bitmap_ints);
-        generateVisitedBitmapKernel<<<numBlocksVisited, 1024>>>(
-            d_distances, d_visited_bitmap, num_nodes);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        bfsBottomUpKernel<<<numBlocksVisited, 1024>>>(
-            graph->d_row_ptr, graph->d_col_idx, d_distances, d_frontier_bitmap,
-            d_visited_bitmap, // New argument
-            d_next_frontier_size, level, num_nodes);
-        CUDA_CHECK(cudaDeviceSynchronize());
-      }
+      bfsBottomUpWarpKernel<<<numBlocksVisited, 1024>>>(
+          graph->d_row_ptr, graph->d_col_idx, d_distances, d_frontier_bitmap,
+          d_visited_bitmap, // New argument
+          d_next_frontier_size, level, num_nodes);
+      CUDA_CHECK(cudaDeviceSynchronize());
 
       // 3. Regenerate Queue for Next Step
       CUDA_CHECK(cudaMemset(d_next_frontier_size, 0, sizeof(int)));
@@ -546,11 +360,6 @@ BFSResult *solveBFS(CSRGraph *graph, node_t source, bool use_streaming) {
   CUDA_CHECK(cudaFree(d_next_frontier_size));
   CUDA_CHECK(cudaFree(d_frontier_bitmap));
   CUDA_CHECK(cudaFree(d_visited_bitmap));
-
-  CUDA_CHECK(cudaFree(d_col_buffers[0]));
-  CUDA_CHECK(cudaFree(d_col_buffers[1]));
-  CUDA_CHECK(cudaStreamDestroy(streams[0]));
-  CUDA_CHECK(cudaStreamDestroy(streams[1]));
 
   return result;
 }
@@ -806,8 +615,6 @@ BFSResult *bfsShared(CSRGraph *graph, BFSOptions *opts) {
   // STANDARD BFS (Fallback)
 
   // We check if (Graph Size + BFS Buffers) < System Limit
-  // Note: Graph is already allocated, so we just check if BFS buffers usually
-  // fit. Ideally we track total usage. Estimation:
   size_t total_est_usage =
       bfs_extra + (size_t)graph->num_nodes * 8 + (size_t)graph->num_edges * 4;
 
@@ -817,13 +624,7 @@ BFSResult *bfsShared(CSRGraph *graph, BFSOptions *opts) {
          system_ram_limit / (1024.0 * 1024.0 * 1024.0));
 
   if (total_est_usage < system_ram_limit) {
-    bool use_streaming = total_est_usage > free_mem;
-    if (use_streaming)
-      printf("Decision: Mapped Memory. Enabling SOTA ASYNC STREAMING.\n");
-    else
-      printf("Decision: Fits in VRAM. Using HIGH-SPEED BFS (In-Core).\n");
-    printf("----------------------------\n");
-    return solveBFS(graph, opts->source, use_streaming);
+    return solveBFS(graph, opts->source);
   } else {
     printf("Decision: Memory exceeds 16GB! Switching to MEMORY-EFFICIENT Union "
            "Find.\n");

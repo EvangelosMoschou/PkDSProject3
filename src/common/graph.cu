@@ -303,51 +303,6 @@ CSRGraph *loadGraphHDF5(const char *filename) {
   return graph;
 }
 
-CSRGraph *generateRandomGraph(node_t num_nodes, edge_t avg_degree) {
-  CSRGraph *graph = new CSRGraph;
-  graph->num_nodes = num_nodes;
-
-  std::vector<std::vector<node_t>> adj(num_nodes);
-
-  // Generate random edges
-  srand(42); // Fixed seed for reproducibility
-  for (node_t i = 0; i < num_nodes; i++) {
-    int degree = rand() % (2 * avg_degree) + 1;
-    for (int j = 0; j < degree; j++) {
-      node_t neighbor = rand() % num_nodes;
-      if (neighbor != i) {
-        adj[i].push_back(neighbor);
-      }
-    }
-  }
-
-  // Count edges
-  graph->num_edges = 0;
-  for (node_t i = 0; i < num_nodes; i++) {
-    graph->num_edges += adj[i].size();
-  }
-
-  // Allocate CSR arrays
-  graph->h_row_ptr = new edge_t[num_nodes + 1];
-  graph->h_col_idx = new node_t[graph->num_edges];
-
-  // Build CSR
-  edge_t edge_idx = 0;
-  for (node_t i = 0; i < num_nodes; i++) {
-    graph->h_row_ptr[i] = edge_idx;
-    std::sort(adj[i].begin(), adj[i].end());
-    for (node_t neighbor : adj[i]) {
-      graph->h_col_idx[edge_idx++] = neighbor;
-    }
-  }
-  graph->h_row_ptr[num_nodes] = edge_idx;
-
-  graph->d_row_ptr = nullptr;
-  graph->d_col_idx = nullptr;
-
-  return graph;
-}
-
 // =============================================================================
 // Memory Management
 // =============================================================================
