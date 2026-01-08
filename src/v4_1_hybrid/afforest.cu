@@ -8,6 +8,16 @@
 // Afforest Kernels (Standard & Compressed)
 // =============================================================================
 
+// Wang Hash for Entropy
+__device__ __forceinline__ unsigned int wang_hash(unsigned int seed) {
+  seed = (seed ^ 61) ^ (seed >> 16);
+  seed *= 9;
+  seed = seed ^ (seed >> 4);
+  seed *= 0x27d4eb2d;
+  seed = seed ^ (seed >> 15);
+  return seed;
+}
+
 // Initialize component labels: component[i] = i
 __global__ void afforest_init_kernel(node_t *component, node_t num_nodes) {
   node_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -40,10 +50,15 @@ __global__ void afforest_sample_kernel(const edge_t *row_ptr,
     edge_t deg = end - start;
 
     if (deg > 0) {
+      // V4.2 Entropy Fix
+      unsigned int r = wang_hash(seed ^ tid);
+
       int limit = (k < deg) ? k : deg;
       for (int i = 0; i < limit; i++) {
-        edge_t neighbor_idx = start + i;
-        node_t neighbor = col_idx[neighbor_idx];
+        // Random Start, Cyclic Scan
+        edge_t offset = (r + i) % deg;
+        edge_t neighbor_pos = start + offset;
+        node_t neighbor = col_idx[neighbor_pos];
 
         node_t u_comp = component[tid];
         node_t v_comp = component[neighbor];
@@ -198,11 +213,11 @@ void solveAfforest(CSRGraph *graph) {
 
   // 2. Sample Phase (skip)
   int k = 2;
-  int sample_iters = 0;
+  int sample_iters = 2; // Enabled (V4.2 fix)
   for (int i = 0; i < sample_iters; i++) {
     afforest_sample_kernel<<<numBlocks, blockSize>>>(
         graph->d_row_ptr, graph->d_col_idx, d_component, graph->num_nodes, k,
-        0);
+        i); // Pass iteration as seed base
     afforest_compress_kernel<<<numBlocks, blockSize>>>(d_component,
                                                        graph->num_nodes);
   }
