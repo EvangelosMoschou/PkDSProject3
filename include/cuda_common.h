@@ -103,6 +103,13 @@ __device__ inline unsigned char atomicCAS_uint8(unsigned char *address,
   } while (assumed != old);
   return (old >> shift) & 0xFF;
 }
+
+// Overload atomicCAS for level_t (unsigned char / uint8_t)
+__device__ inline level_t atomicCAS(level_t *address, level_t compare,
+                                    level_t val) {
+  return atomicCAS_uint8((unsigned char *)address, (unsigned char)compare,
+                         (unsigned char)val);
+}
 #endif
 
 #endif // CUDA_COMMON_H

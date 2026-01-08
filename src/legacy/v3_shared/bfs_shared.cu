@@ -1,5 +1,9 @@
+#define CUDA_ATOMICS_IMPL
 #include "../common/compression.h"
-#include "../v4_adaptive/bfs_adaptive.h"
+#include "../v4_1_hybrid/bfs_adaptive.h"
+#define BFS_KERNELS_SKIP_DEFINITIONS // Don't define kernels - use those from
+                                     // bfs_adaptive.o
+#include "bfs_kernels.cuh"
 #include "bfs_shared.h"
 #include <cstring>
 
@@ -18,7 +22,6 @@
 // =============================================================================
 // Kernels: BFS (Breadth-First Search)
 // =============================================================================
-
 
 __global__ void bfsWarpKernel(
     const edge_t *__restrict__ row_ptr, const node_t *__restrict__ col_idx,
@@ -153,100 +156,9 @@ __global__ void connectivityToDistanceKernel(const node_t *__restrict__ parent,
 // =============================================================================
 // Internal Solver Implementations
 // =============================================================================
-
-// Optimization B: Warp-Cooperative Bottom-Up Kernel
-// - Warps load row_ptr cooperatively and scan adjacency lists together.
-__global__ void
-bfsBottomUpWarpKernel(const edge_t *__restrict__ row_ptr,
-                      const node_t *__restrict__ col_idx,
-                      level_t *__restrict__ distances,
-                      const unsigned int *__restrict__ frontier_bitmap,
-                      const unsigned int *__restrict__ visited_bitmap,
-                      int *__restrict__ next_frontier_size,
-                      const level_t current_level, node_t num_nodes) {
-  int tid = threadIdx.x;
-  int warp_id = tid / WARP_SIZE;
-  int lane_id = tid % WARP_SIZE;
-  int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-
-  // Each warp processes WARP_SIZE nodes, but ideally needs ONE node per warp if
-  // doing cooperative scan? Actually, Bottom-Up is best when one Thread = One
-  // Node? No. If high-degree unvisited node, one thread = slow. If we map 1
-  // Warp -> 1 Node:
-
-  node_t u = global_warp_id;
-  if (u < num_nodes) {
-    bool visited = (visited_bitmap[u / 32] >> (u % 32)) & 1;
-    if (!visited) {
-      edge_t start = row_ptr[u];
-      edge_t end = row_ptr[u + 1];
-      bool found = false;
-
-      // Cooperative Scan
-      for (edge_t e = start + lane_id; e < end; e += WARP_SIZE) {
-        node_t neighbor = col_idx[e];
-        if ((frontier_bitmap[neighbor / 32] >> (neighbor % 32)) & 1) {
-          found = true;
-        }
-        if (__any_sync(0xFFFFFFFF, found)) {
-          found = true;
-          break; // Fast exit if any thread finds it
-        }
-      }
-
-      if (found) {
-        if (lane_id == 0)
-          distances[u] = current_level + 1;
-      }
-    }
-  }
-}
-
-// Kernel to convert Queue to Bitmap
-__global__ void queueToBitmapKernel(const node_t *__restrict__ queue, int size,
-                                    unsigned int *__restrict__ bitmap) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size) {
-    node_t node = queue[tid];
-    atomicOr(&bitmap[node / 32], (1 << (node % 32)));
-  }
-}
-
-// Generate Visited Bitmap from Distances
-__global__ void
-generateVisitedBitmapKernel(const level_t *__restrict__ distances,
-                            unsigned int *__restrict__ visited_bitmap,
-                            node_t num_nodes) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < num_nodes) {
-    if (distances[tid] != UNVISITED) {
-      atomicOr(&visited_bitmap[tid / 32], (1 << (tid % 32)));
-    }
-  }
-}
-
-// Kernel to clear Bitmap
-__global__ void clearBitmapKernel(unsigned int *__restrict__ bitmap,
-                                  int size_ints) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size_ints)
-    bitmap[tid] = 0;
-}
-
-// Kernel to generate Queue from Distances (switch back to Top-Down)
-__global__ void distancesToQueueKernel(const level_t *__restrict__ distances,
-                                       node_t num_nodes,
-                                       node_t *__restrict__ queue,
-                                       int *__restrict__ queue_size,
-                                       level_t level) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < num_nodes) {
-    if (distances[tid] == level) {
-      int idx = atomicAdd(queue_size, 1);
-      queue[idx] = tid;
-    }
-  }
-}
+// NOTE: bfsBottomUpWarpKernel, queueToBitmapKernel,
+// generateVisitedBitmapKernel,
+//       clearBitmapKernel, distancesToQueueKernel are now in bfs_kernels.cuh
 
 BFSResult *solveBFS(CSRGraph *graph, node_t source) {
   node_t num_nodes = graph->num_nodes;
@@ -708,7 +620,8 @@ int main(int argc, char **argv) {
       }
     } else {
       if (opts.algorithm == ALGO_ADAPTIVE) {
-        final_result = solveBFSAdaptive(graph, opts.source);
+        final_result = solveBFSAdaptiveWithThreshold(graph, opts.source,
+                                                     opts.bu_threshold_divisor);
       } else if (opts.algorithm == ALGO_AFFOREST) {
         solveAfforest(graph);
         // Afforest does not return BFSResult yet, preventing double-free logic

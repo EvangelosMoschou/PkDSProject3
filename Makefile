@@ -59,16 +59,16 @@ $(V3_BIN): $(COMMON_OBJS) $(V3_OBJS)
 $(OBJ_DIR)/bfs_shared.o: $(SRC_DIR)/legacy/v3_shared/bfs_shared.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/bfs_adaptive.o: $(SRC_DIR)/v4_adaptive/bfs_adaptive.cu
+$(OBJ_DIR)/bfs_adaptive.o: $(SRC_DIR)/v4_1_hybrid/bfs_adaptive.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
 $(OBJ_DIR)/bfs_compressed_kernels.o: $(SRC_DIR)/legacy/v3_shared/bfs_compressed_kernels.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/bfs_compressed_adaptive.o: $(SRC_DIR)/v4_adaptive/bfs_compressed_adaptive.cu
+$(OBJ_DIR)/bfs_compressed_adaptive.o: $(SRC_DIR)/v4_1_hybrid/bfs_compressed_adaptive.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/afforest.o: $(SRC_DIR)/v4_adaptive/afforest.cu
+$(OBJ_DIR)/afforest.o: $(SRC_DIR)/v4_1_hybrid/afforest.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
 # Common objects

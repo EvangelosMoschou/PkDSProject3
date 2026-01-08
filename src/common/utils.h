@@ -92,6 +92,8 @@ typedef struct {
   bool json_output;
   bool compression;
   AlgorithmType algorithm;
+  int bu_threshold_divisor; // Bottom-Up threshold = num_nodes /
+                            // bu_threshold_divisor (default: 20 = 5%)
 } BFSOptions;
 
 /**
