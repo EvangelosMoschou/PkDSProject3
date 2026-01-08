@@ -95,6 +95,71 @@ __global__ void distancesToQueueKernel(const level_t *__restrict__ distances,
  *
  * Optimized for large frontiers where Top-Down creates excessive atomics.
  */
+// Bottom-Up BFS Traversal with Direct Queue Emission (V5.3)
+__global__ void
+bfsBottomUpWarpKernel_Direct(const edge_t *__restrict__ row_ptr,
+                             const node_t *__restrict__ col_idx,
+                             level_t *__restrict__ distances,
+                             const unsigned int *__restrict__ frontier_bitmap,
+                             const unsigned int *__restrict__ visited_bitmap,
+                             int *__restrict__ next_frontier_size,
+                             node_t *__restrict__ next_frontier, // Added
+                             const level_t current_level, node_t num_nodes) {
+
+  int tid = threadIdx.x;
+  int warp_id = tid / WARP_SIZE;
+  int lane_id = tid % WARP_SIZE;
+  int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+
+  node_t u = global_warp_id;
+  if (u < num_nodes) {
+    bool visited = false;
+    // Visited Bitmap Check (Optional: Could assume distances[u] != UNVISITED)
+    if (visited_bitmap)
+      visited = (visited_bitmap[u / 32] >> (u % 32)) & 1;
+    else
+      visited = (distances[u] != UNVISITED);
+
+    bool found = false;
+
+    if (!visited) {
+      edge_t start = row_ptr[u];
+      edge_t end = row_ptr[u + 1];
+
+      // Cooperative scan
+      for (edge_t e = start + lane_id; e < end && !found; e += WARP_SIZE) {
+        node_t neighbor = col_idx[e];
+        if ((frontier_bitmap[neighbor / 32] >> (neighbor % 32)) & 1) {
+          found = true;
+        }
+        if (__any_sync(0xFFFFFFFF, found)) {
+          found = true;
+          break;
+        }
+      }
+
+      // V5.3: Warp-Aggregated Queue Append
+      // 1. Leader updates distance
+      if (found && lane_id == 0) {
+        distances[u] = current_level + 1;
+      }
+    }
+    // 2. Warp-Aggregated Queue Emission (Only if node 'u' was found by this
+    // warp)
+    // Note: 'found' is true for all lanes if any lane found it.
+    // However, only 1 node 'u' is processed by the warp.
+    // So we just need 1 Atomic add.
+
+    if (found) {
+      if (lane_id == 0) {
+        int idx = atomicAdd(next_frontier_size, 1);
+        next_frontier[idx] = u;
+      }
+    }
+  }
+}
+
+// Legacy Bottom-Up BFS Kernel (Warp-Cooperative)
 __global__ void
 bfsBottomUpWarpKernel(const edge_t *__restrict__ row_ptr,
                       const node_t *__restrict__ col_idx,
@@ -103,36 +168,31 @@ bfsBottomUpWarpKernel(const edge_t *__restrict__ row_ptr,
                       const unsigned int *__restrict__ visited_bitmap,
                       int *__restrict__ next_frontier_size,
                       const level_t current_level, node_t num_nodes) {
-
+  // ... (Legacy body kept for bfs_shared.cu compatibility if needed)
   int tid = threadIdx.x;
   int warp_id = tid / WARP_SIZE;
   int lane_id = tid % WARP_SIZE;
   int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
 
-  // Each warp processes one node
   node_t u = global_warp_id;
   if (u < num_nodes) {
-    // Check if already visited using bitmap (fast path)
     bool visited = (visited_bitmap[u / 32] >> (u % 32)) & 1;
     if (!visited) {
       edge_t start = row_ptr[u];
       edge_t end = row_ptr[u + 1];
       bool found = false;
 
-      // Cooperative scan: each lane checks a portion of neighbors
       for (edge_t e = start + lane_id; e < end && !found; e += WARP_SIZE) {
         node_t neighbor = col_idx[e];
         if ((frontier_bitmap[neighbor / 32] >> (neighbor % 32)) & 1) {
           found = true;
         }
-        // Fast exit if any thread in warp found a frontier neighbor
         if (__any_sync(0xFFFFFFFF, found)) {
           found = true;
           break;
         }
       }
 
-      // Only lane 0 updates distance (avoids duplicate writes)
       if (found && lane_id == 0) {
         distances[u] = current_level + 1;
         atomicAdd(next_frontier_size, 1);
@@ -171,6 +231,14 @@ bfsBottomUpWarpKernel(const edge_t *__restrict__ row_ptr,
                       const unsigned int *__restrict__ visited_bitmap,
                       int *__restrict__ next_frontier_size,
                       const level_t current_level, node_t num_nodes);
+
+extern __global__ void bfsBottomUpWarpKernel_Direct(
+    const edge_t *__restrict__ row_ptr, const node_t *__restrict__ col_idx,
+    level_t *__restrict__ distances,
+    const unsigned int *__restrict__ frontier_bitmap,
+    const unsigned int *__restrict__ visited_bitmap,
+    int *__restrict__ next_frontier_size, node_t *__restrict__ next_frontier,
+    const level_t current_level, node_t num_nodes);
 #endif // BFS_KERNELS_SKIP_DEFINITIONS (declarations)
 
 #endif // BFS_KERNELS_CUH

@@ -1,5 +1,7 @@
 #define CUDA_ATOMICS_IMPL
-#include "../legacy/v3_shared/bfs_compressed_kernel.cuh"
+// Restoration of Legacy Kernels (Best Performance: 996ms)
+// Restoration of Legacy Kernels (Best Performance: 996ms)
+#include "../legacy/v3_shared/bfs_compressed_kernel.cuh" // Legacy Prototypes
 #define BFS_KERNELS_SKIP_DEFINITIONS
 #include "bfs_kernels.cuh"
 #include "cuda_common.h"
@@ -12,6 +14,13 @@
 // Classifier Kernel for Compressed Graph with Hierarchical Atomics (V4.2)
 // Optimization: Warp-level aggregation + Shared atomics -> Reduces global
 // contention
+// Deep-Inline Kernels Removed (Performance Regression)
+// Using Legacy Kernels from bfs_compressed_kernels.cu
+
+// Classifier Kernel for Compressed Graph
+// Classifier Kernel for Compressed Graph with Hierarchical Atomics (V4.2)
+// Optimization: Warp-level aggregation + Shared atomics -> Reduces global
+// contention
 __global__ void classifyCompressedFrontierKernel(
     const node_t *__restrict__ frontier, int frontier_size,
     const edge_t *__restrict__ row_ptr, node_t *__restrict__ q_small,
@@ -19,9 +28,10 @@ __global__ void classifyCompressedFrontierKernel(
     int *__restrict__ count_large) {
 
   // Shared memory for block-level aggregation
-  __shared__ int s_counts[2];        // [0]=small, [1]=large
-  __shared__ int s_offsets[2];       // Global base offsets
-  __shared__ int s_warp_bases[2][8]; // Per-warp base within block (max 8 warps)
+  __shared__ int s_counts[2];  // [0]=small, [1]=large
+  __shared__ int s_offsets[2]; // Global base offsets
+  // V5.3: Hardening - Support up to 32 warps (1024 threads)
+  __shared__ int s_warp_bases[2][32];
 
   int tid = threadIdx.x;
   int gid = blockIdx.x * blockDim.x + tid;
@@ -99,44 +109,32 @@ __global__ void classifyCompressedFrontierKernel(
 }
 
 // Bottom-Up Kernel for Compressed Graph
-// Decodes neighbor lists on the fly to find *any* parent in the frontier.
+// Optimized V5.2: Direct Queue Emission (Warp-Aggregated)
+// Removes O(N) scan after this kernel.
 __global__ void
 bfsCompressedBottomUpKernel(const edge_t *__restrict__ row_ptr,
                             const uint8_t *__restrict__ compressed_col,
                             level_t *__restrict__ distances,
                             const unsigned int *__restrict__ frontier_bitmap,
-                            const unsigned int *__restrict__ visited_bitmap,
                             int *__restrict__ next_frontier_size,
+                            node_t *__restrict__ next_frontier, // Added
                             level_t current_level, node_t num_nodes) {
 
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int warp_id = tid / 32;
   int lane_id = tid % 32;
 
-  // Warp-strided loop over nodes to ensure coalescing if possible,
-  // though bottom-up usually maps 1 thread/node or 1 warp/node.
-  // Given the decoding cost, 1 thread per node is simple but divergent.
-  // 1 Warp per node is better for bandwidth but complex to decode in parallel.
-  // We stick to the standard V3 Bottom-Up pattern: 1 Thread per Node (strided).
-
-  // Actually, V3 bfsBottomUpWarpKernel from bfs_kernels.cuh uses 1 Warp per
-  // Chunk of nodes? Let's stick to a simple 1-thread-per-node approach for the
-  // compressed version first, utilizing the L2 cache for the byte stream.
-
+  // Stride over nodes
   for (int u = tid; u < num_nodes; u += gridDim.x * blockDim.x) {
-    // Optimization: Use bitmap cache instead of global distances array (32x B/W
-    // savings)
-    bool is_visited = (visited_bitmap[u / 32] & (1 << (u % 32)));
-    if (!is_visited) {
+    bool found = false;
+
+    if (distances[u] == UNVISITED) {
       // Check neighbors
       edge_t curr = row_ptr[u];
       edge_t end = row_ptr[u + 1];
       node_t prev_neighbor = 0;
 
-      bool found_parent = false;
-
       while (curr < end) {
-        // Decode Varint
+        // Decode Varint (Serial)
         node_t val = 0;
         int shift = 0;
         uint8_t byte;
@@ -149,18 +147,35 @@ bfsCompressedBottomUpKernel(const edge_t *__restrict__ row_ptr,
         node_t v = prev_neighbor + val;
         prev_neighbor = v;
 
-        // Check overlap with frontier bitmap
-        // Optimize: check visited bitmap first? No, we checking if we ARE
-        // unvisited (line 35). We check if neighbor v is in frontier.
-
-        bool is_frontier = (frontier_bitmap[v / 32] & (1 << (v % 32)));
-        if (is_frontier) {
+        // Check frontier bitmap
+        if (frontier_bitmap[v / 32] & (1 << (v % 32))) {
           distances[u] = current_level + 1;
-          // atomicAdd(next_frontier_size, 1); // REMOVED: Redundant bottleneck.
-          // Count is recalculated in distancesToQueueKernel.
-          found_parent = true;
-          break;
+          found = true;
+          break; // Found parent, stop
         }
+      }
+    }
+
+    // Warp-Aggregated Queue Append
+    // 1. Ballot valid threads
+    unsigned int ballot = __ballot_sync(0xFFFFFFFF, found);
+
+    // 2. Compute popcount
+    int pop_count = __popc(ballot);
+
+    // 3. Leader reserves space
+    if (pop_count > 0) {
+      int base_idx = 0;
+      if (lane_id == 0) {
+        base_idx = atomicAdd(next_frontier_size, pop_count);
+      }
+      base_idx = __shfl_sync(0xFFFFFFFF, base_idx, 0);
+
+      // 4. Compute local offset and store
+      if (found) {
+        unsigned int mask = (1u << lane_id) - 1;
+        int local_offset = __popc(ballot & mask);
+        next_frontier[base_idx + local_offset] = u;
       }
     }
   }
@@ -183,7 +198,7 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
 
   // Bitmaps for Bottom-Up
   int bitmap_ints = (num_nodes + 31) / 32;
-  unsigned int *d_frontier_bitmap, *d_visited_bitmap;
+  unsigned int *d_frontier_bitmap; // d_visited_bitmap removed (V5.3)
 
   // Host vars
   int h_frontier_size;
@@ -209,7 +224,7 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
   // Bitmaps
   CUDA_CHECK(
       cudaMalloc(&d_frontier_bitmap, bitmap_ints * sizeof(unsigned int)));
-  CUDA_CHECK(cudaMalloc(&d_visited_bitmap, bitmap_ints * sizeof(unsigned int)));
+  // d_visited_bitmap removed
 
   // 2. Initialize Source
   node_t start_node = source;
@@ -228,15 +243,12 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
 
   int level = 0;
 
-  // Tuning: Aggressive Bottom-Up for Compressed
-  // Decode overhead suggests we want to avoid Edge-Scanning large frontiers
-  // even more.
-  // V4.3 Tuning: N/26 (~2.5M). Strategy:
-  // - Level 2 (2.1M): Run Top-Down (Fast expansion, high degree)
-  // - Level 5 (3.0M): Run Bottom-Up (Sparsae/Dense transition, save work)
+  // Tuning: Aggressive Bottom-Up for Compressed (V4.3 Best Speed: 996ms)
+  // Bu_Threshold = N/26 (2.5M) forces L5 (3M) and above to Bottom-Up.
+  // This avoids the slow Top-Down decoding for large frontiers.
   int bu_threshold = num_nodes / 26;
 
-  printf("Starting Compressed BFS (Hybrid V4.3). Threshold: %d\n",
+  printf("Starting Compressed BFS (Hybrid V5.1). Threshold: %d\n",
          bu_threshold);
 
   while (h_frontier_size > 0) {
@@ -253,30 +265,26 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
           d_frontier, h_frontier_size, d_frontier_bitmap);
       CUDA_CHECK(cudaDeviceSynchronize());
 
-      // 2. Visited Bitmap (Required for Optimized Kernel)
-      clearBitmapKernel<<<(bitmap_ints + 255) / 256, 256>>>(d_visited_bitmap,
-                                                            bitmap_ints);
-      generateVisitedBitmapKernel<<<(num_nodes + 255) / 256, 256>>>(
-          d_distances, d_visited_bitmap, num_nodes);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      // 2. Visited Bitmap (Skipped: Direct check is faster for compressed)
+      // clearBitmapKernel... (Removed)
+      // generateVisitedBitmapKernel... (Removed)
 
       // 3. Kernel
+      // 3. Kernel (Now emits queue directly)
       int threads = 256;
       int blocks = (num_nodes + threads - 1) / threads;
       bfsCompressedBottomUpKernel<<<blocks, threads>>>(
           graph->d_row_Ptr, graph->d_compressed_col, d_distances,
-          d_frontier_bitmap, d_visited_bitmap, d_next_frontier_size, level,
+          d_frontier_bitmap, d_next_frontier_size, d_next_frontier, level,
           num_nodes);
-      CUDA_CHECK(cudaDeviceSynchronize());
 
-      // 4. Regenerate Queue
-      // We reuse the standard distancesToQueueKernel
-      CUDA_CHECK(cudaMemset(d_next_frontier_size, 0,
-                            sizeof(int))); // clear again to count for queue
-      distancesToQueueKernel<<<(num_nodes + 255) / 256, 256>>>(
-          d_distances, num_nodes, d_next_frontier, d_next_frontier_size,
-          level + 1);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      // Removed: atomicAdd contention reduced via Warp Aggregation
+      // Removed: distancesToQueueKernel (O(N) Scan eliminated)
+
+      // Sync moved to end of loop or removed if not needed?
+      // We need to sync before swapping if we read frontier size on host.
+      // But we can check for errors.
+      // cudaDeviceSynchronize(); // Optimized: Let it overlap or sync later.
 
     } else {
       // === TOP-DOWN COMPRESSED ===
@@ -345,7 +353,7 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
   CUDA_CHECK(cudaFree(d_count_small));
   CUDA_CHECK(cudaFree(d_count_large));
   CUDA_CHECK(cudaFree(d_frontier_bitmap));
-  CUDA_CHECK(cudaFree(d_visited_bitmap));
+  // CUDA_CHECK(cudaFree(d_visited_bitmap)); removed
 
   return res;
 }

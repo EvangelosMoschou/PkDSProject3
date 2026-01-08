@@ -213,7 +213,7 @@ void solveAfforest(CSRGraph *graph) {
 
   // 2. Sample Phase (skip)
   int k = 2;
-  int sample_iters = 2; // Enabled (V4.2 fix)
+  int sample_iters = 1; // Tuned for V5.1 (Low Overhead)
   for (int i = 0; i < sample_iters; i++) {
     afforest_sample_kernel<<<numBlocks, blockSize>>>(
         graph->d_row_ptr, graph->d_col_idx, d_component, graph->num_nodes, k,
@@ -287,9 +287,11 @@ void solveAfforestCompressed(CompressedCSRGraph *graph) {
   CUDA_CHECK(cudaMalloc(&d_changed, sizeof(bool)));
 
   // Just 1 Iteration
+  // V5.3: Disable pruning (GCC_ID = -1) as per user recommendation for
+  // compressed mode
   afforest_compressed_link_kernel<<<numBlocks, blockSize>>>(
       graph->d_row_Ptr, graph->d_compressed_col, d_component, graph->num_nodes,
-      h_GCC_ID, d_changed);
+      -1, d_changed);
 
   afforest_compress_kernel<<<numBlocks, blockSize>>>(d_component,
                                                      graph->num_nodes);
