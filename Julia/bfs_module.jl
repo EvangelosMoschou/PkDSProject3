@@ -1,7 +1,11 @@
 # ==============================================================================
-# BFS & Afforest Module for Julia (V4 Compatible)
+# BFS & Afforest Module for Julia (V5.3 Compatible)
 # Parallel Processing Project 3 - AUTH
 # Includes: Adaptive BFS, Compressed BFS, Afforest (CPU/GPU)
+#
+# Note: This Julia implementation mirrors the CUDA V5.3 algorithms but does NOT
+# include the V5.3 kernel optimizations (Direct Queue Emission, Warp Aggregation).
+# For peak performance, use the CUDA implementation.
 # ==============================================================================
 
 module BFSModule
@@ -603,7 +607,12 @@ end
     afforest_compressed_cpu(graph::CompressedCSRGraph; sampling_rounds::Int=0)
 
 CPU Afforest on compressed graph (single-pass, no sampling for efficiency).
-Matches V4 CUDA implementation.
+Matches V5.3 CUDA implementation (pruning disabled for compressed graphs).
+
+# V5.3 Note:
+In the CUDA implementation, pruning is disabled for compressed graphs because
+the GCC ID cannot be reliably determined without costly sampling. This Julia
+version mirrors that behavior.
 """
 function afforest_compressed_cpu(graph::CompressedCSRGraph; sampling_rounds::Int=0)
     num_nodes = graph.num_nodes

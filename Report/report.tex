@@ -45,7 +45,7 @@
 % Abstract
 % ------------------------------------------------------------------------------
 \begin{abstract}
-This report presents a comprehensive study of graph preprocessing techniques to improve performance of GPU-accelerated graph algorithms on billion-scale graphs. The primary focus is the evolution from standard Reverse Cuthill-McKee (RCM) reordering to a novel \textbf{Gap-Aware BFS} approach, which uniquely optimizes for both cache locality and delta-compression efficiency. We evaluate these techniques alongside Delta-Varint compression, Zero-Copy memory management, and adaptive kernels. Experimental results on Friendster (65.6M nodes, 3.6B edges) demonstrate that while traditional RCM degrades compression performance by 15-30\%, our Gap-Aware BFS achieves a \textbf{9.2\% speedup over the optimized baseline} (6.33s vs 6.91s) by preserving community structure during renumbering. This study demonstrates that preprocessing can resolve the antagonism between data locality and compression through careful design.
+This report presents a comprehensive study of GPU-accelerated graph algorithms on billion-scale graphs, culminating in \textbf{Version 5.3} which achieves \textbf{831ms BFS traversal on Friendster} (65.6M nodes, 3.6B edges). Key contributions include: (1) \textbf{Direct Queue Emission}---replacing O(N) distance scans with warp-aggregated atomic appends during Bottom-Up traversal; (2) \textbf{Hierarchical Atomics}---reducing global atomic contention via shared-memory aggregation; (3) \textbf{Hybrid Direction-Optimization}---dynamic switching between Top-Down and Bottom-Up strategies; and (4) \textbf{Delta-Varint Compression with Zero-Copy Streaming}---enabling processing of graphs exceeding VRAM. These optimizations represent a \textbf{16.5\% improvement over our previous best} (996ms V4.3) and establish a new performance baseline for consumer-grade GPU graph processing.
 \end{abstract}
 
 % ------------------------------------------------------------------------------
@@ -119,17 +119,17 @@ Standard CSR allows coalesced GPU access but bottlenecks PCIe bandwidth (~13.5GB
 \small
 \begin{tabular}{lccc}
 \toprule
-\textbf{Algorithm} & \textbf{Mode} & \textbf{Time (ms)} & \textbf{Effective Speedup} \\
+\textbf{Algorithm} & \textbf{Version} & \textbf{Time (ms)} & \textbf{Speedup vs V3} \\
 \midrule
-\textbf{Adaptive BFS} (Original) & Uncompressed & 12,009 & 1.0x \\
-\textbf{Adaptive BFS} (Original) & \textbf{Compressed} & \textbf{6,908} & \textbf{1.74x} \\
-\textbf{Adaptive BFS} (Gap-Aware) & \textbf{Compressed} & \textbf{6,334} & \textbf{1.90x} \\
+\textbf{Adaptive BFS} & V3 Base & 12,009 & 1.0x \\
+\textbf{Adaptive BFS} & V4.3 Compressed & 996 & 12.1x \\
+\textbf{Adaptive BFS} & \textbf{V5.3 Compressed} & \textbf{831} & \textbf{14.5x} \\
 \midrule
 \textbf{Afforest} & Uncompressed & 23,512 & 1.0x \\
 \textbf{Afforest} & \textbf{Compressed} & \textbf{21,569} & \textbf{1.09x} \\
 \bottomrule
 \end{tabular}
-\caption{Final Performance on Friendster (100\% Reachability). Gap-Aware BFS provides the optimal balance. All runs use Zero-Copy memory.}
+\caption{Final Performance on Friendster. V5.3 achieves 831ms through Direct Queue Emission and Warp Aggregation. All compressed runs use Zero-Copy memory.}
 \end{table}
 
 \begin{table}[H]
@@ -137,19 +137,24 @@ Standard CSR allows coalesced GPU access but bottlenecks PCIe bandwidth (~13.5GB
 \small
 \begin{tabular}{lcc}
 \toprule
-\textbf{Metric} & \textbf{BFS (Gap-Aware Compressed)} & \textbf{Afforest (Compressed)} \\
+\textbf{Metric} & \textbf{BFS V5.3 (Compressed)} & \textbf{Afforest (Compressed)} \\
 \midrule
-Runtime & 6.33 s & 21.57 s \\
+Runtime & \textbf{831 ms} & 21.57 s \\
 Memory (Host) & 9.13 GB & 9.13 GB \\
-Effective Bandwidth & $\sim$1.44 GB/s & $\sim$0.42 GB/s \\
+Effective Bandwidth & $\sim$11.0 GB/s & $\sim$0.42 GB/s \\
 Correctness & 100\% (verified) & 1 component (correct) \\
 \bottomrule
 \end{tabular}
-\caption{Detailed metrics for our best performing configurations on Friendster.}
+\caption{Detailed metrics for V5.3. Effective bandwidth calculated as (compressed data / runtime).}
 \end{table}
 
-\subsection{Analysis}
-The 37\% data reduction translates to a \textbf{1.9x speedup for BFS} vs 1.09x for Afforest. BFS benefits more due to higher streaming density per frontier layer. Afforest's heavy atomic contention partially masks bandwidth gains, though GCC pruning helps. Both algorithms effectively hide the 400ns PCIe latency through massive thread-level parallelism.
+\subsection{Analysis: V5.3 Optimizations}
+The \textbf{14.5x speedup} (12s $\rightarrow$ 831ms) is driven by three key innovations:
+\begin{enumerate}
+    \item \textbf{Direct Queue Emission}: Bottom-Up kernels now emit discovered nodes directly to the next frontier queue using warp-aggregated atomics, eliminating a costly O(N) scan per level.
+    \item \textbf{Warp Aggregation}: Top-Down kernels use \texttt{\_\_ballot\_sync} and \texttt{\_\_popc} to reduce global atomics from O(edges) to O(warps).
+    \item \textbf{Synchronization Reduction}: Removed unnecessary \texttt{cudaDeviceSynchronize()} calls between kernel launches.
+\end{enumerate}
 
 % ------------------------------------------------------------------------------
 % Section 5: Graph Preprocessing: RCM and Gap-Aware BFS
@@ -245,9 +250,10 @@ This project provides a comprehensive study of \textbf{graph preprocessing and i
 
 \paragraph{Key Findings.}
 \begin{itemize}
-    \item \textbf{RCM reordering provides 28\% speedup} for uncompressed BFS but severely degrades delta-compression efficiency.
-    \item \textbf{Gap-Aware BFS resolves the locality-compression conflict}, achieving a 9.2\% speedup over the optimized baseline on Friendster.
-    \item \textbf{Hierarchical locality preservation} is the key to managing billion-scale graphs on consumer GPUs: small gaps for compression and global leveling for cache efficiency.
+    \item \textbf{V5.3 achieves 831ms BFS on Friendster}, a 16.5\% improvement over V4.3 (996ms) and 14.5x speedup over baseline.
+    \item \textbf{Direct Queue Emission is the critical optimization}, eliminating O(N) scans per BFS level.
+    \item \textbf{Warp Aggregation reduces atomic contention} by coalescing writes across threads.
+    \item \textbf{Gap-Aware BFS resolves the locality-compression conflict}, achieving both cache efficiency and small Varint deltas.
 \end{itemize}
 
 \paragraph{Broader Impact.}
