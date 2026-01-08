@@ -156,9 +156,9 @@ BFSOptions parseArgs(int argc, char **argv) {
   opts.benchmark = false;
   opts.num_runs = 1;
   opts.json_output = false;
-  opts.json_output = false;
-  opts.compression = false; // Initialize explicitly
+  opts.compression = false;
   opts.algorithm = ALGO_BFS;
+  opts.bu_threshold_divisor = 20; // Default: 5% of nodes triggers Bottom-Up
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
@@ -194,6 +194,12 @@ BFSOptions parseArgs(int argc, char **argv) {
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       printUsage(argv[0]);
       exit(0);
+    } else if (strcmp(argv[i], "--bu-threshold") == 0) {
+      if (i + 1 < argc) {
+        opts.bu_threshold_divisor = atoi(argv[++i]);
+        if (opts.bu_threshold_divisor <= 0)
+          opts.bu_threshold_divisor = 20;
+      }
     } else if (argv[i][0] != '-') {
       opts.graph_file = argv[i];
     }
@@ -213,12 +219,17 @@ void printUsage(const char *program) {
   printf("\nOptions:\n");
   printf("  -s, --source <n>     Source node for BFS (default: 0)\n");
   printf("  --algo <type>        Algorithm: 'bfs', 'adaptive', 'afforest'\n");
+  printf("  --bu-threshold <n>   Bottom-Up threshold divisor (default: 20 = "
+         "5%%)\n");
+  printf("                       Switches to Bottom-Up when frontier > N/n\n");
   printf("  -v, --verbose        Enable verbose output\n");
   printf("  -n, --no-validate    Skip validation against CPU\n");
   printf("  -b, --benchmark <n>  Run benchmark with n iterations\n");
   printf("  --json               Output results in JSON format\n");
+  printf("  --compress           Enable graph compression (Zero-Copy)\n");
   printf("  -h, --help           Show this help message\n");
   printf("\nGraph file formats supported:\n");
   printf("  .txt    Edge list (first line: nodes edges)\n");
   printf("  .csrbin CSR binary format\n");
+  printf("  .mat    HDF5/MAT format\n");
 }
