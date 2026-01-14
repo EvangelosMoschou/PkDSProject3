@@ -449,7 +449,7 @@ BFSResult *solveBFSAdaptiveWithThreshold(CSRGraph *graph, node_t source,
   CUDA_CHECK(cudaFree(d_counts));
   CUDA_CHECK(cudaFree(d_next_frontier_size));
   CUDA_CHECK(cudaFree(d_frontier_bitmap));
-  CUDA_CHECK(cudaFree(d_frontier_bitmap));
+
   // CUDA_CHECK(cudaFree(d_visited_bitmap)); removed
   CUDA_CHECK(cudaFreeHost(h_counts));
 

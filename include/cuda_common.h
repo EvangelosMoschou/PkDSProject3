@@ -51,9 +51,10 @@
 // Type Definitions
 // =============================================================================
 
-typedef int node_t;            // Node ID type
-typedef long long edge_t;      // Edge count type
-typedef unsigned int level_t;  // BFS level type (native 32-bit for hardware atomics)
+typedef int node_t;       // Node ID type
+typedef long long edge_t; // Edge count type
+typedef unsigned int
+    level_t; // BFS level type (native 32-bit for hardware atomics)
 
 // =============================================================================
 // Utility Functions
@@ -84,32 +85,5 @@ inline void printDeviceInfo() {
          prop.maxGridSize[1], prop.maxGridSize[2]);
   printf("=======================\n\n");
 }
-
-#ifdef CUDA_ATOMICS_IMPL
-// Helper for 8-bit atomic CAS (Simulates byte atomic on 32-bit word)
-__device__ inline unsigned char atomicCAS_uint8(unsigned char *address,
-                                                unsigned char compare,
-                                                unsigned char val) {
-  unsigned int *base = (unsigned int *)((size_t)address & ~3);
-  unsigned int shift = ((size_t)address & 3) * 8;
-  unsigned int mask = 0xFF << shift;
-  unsigned int old = *base, assumed;
-  do {
-    assumed = old;
-    if (((old >> shift) & 0xFF) != compare)
-      return (old >> shift) & 0xFF;
-    old =
-        atomicCAS(base, assumed, (old & ~mask) | ((unsigned int)val << shift));
-  } while (assumed != old);
-  return (old >> shift) & 0xFF;
-}
-
-// Overload atomicCAS for level_t (unsigned char / uint8_t)
-__device__ inline level_t atomicCAS(level_t *address, level_t compare,
-                                    level_t val) {
-  return atomicCAS_uint8((unsigned char *)address, (unsigned char)compare,
-                         (unsigned char)val);
-}
-#endif
 
 #endif // CUDA_COMMON_H

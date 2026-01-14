@@ -23,15 +23,16 @@ __global__ void bfsChunkedKernel(
     const int frontier_size, node_t *__restrict__ next_frontier,
     int *__restrict__ next_frontier_size, const level_t current_level) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
 
-  if (tid < frontier_size) {
-    node_t current = frontier[tid];
+  for (int i = tid; i < frontier_size; i += stride) {
+    node_t current = frontier[i];
     edge_t start = row_ptr[current];
     edge_t end = row_ptr[current + 1];
     edge_t degree = end - start;
 
-    for (edge_t i = 0; i < degree; i++) {
-      node_t neighbor = col_idx[start + i];
+    for (edge_t j = 0; j < degree; j++) {
+      node_t neighbor = col_idx[start + j];
 
       // Optimization: Native 32-bit Atomics
       level_t old_val = atomicCAS(&distances[neighbor], (level_t)UNVISITED,

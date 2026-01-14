@@ -37,6 +37,8 @@ V3_OBJS = $(OBJ_DIR)/bfs_shared.o $(OBJ_DIR)/bfs_adaptive.o \
           $(OBJ_DIR)/afforest.o
 
 # Executables
+V1_BIN = $(BIN_DIR)/bfs_v1
+V2_BIN = $(BIN_DIR)/bfs_v2
 V3_BIN = $(BIN_DIR)/bfs_v3
 
 # =============================================================================
@@ -45,7 +47,7 @@ V3_BIN = $(BIN_DIR)/bfs_v3
 
 .PHONY: all v3 clean dirs
 
-all: dirs v3
+all: dirs v3 v1 v2
 
 dirs:
 	@mkdir -p $(BIN_DIR) $(OBJ_DIR)
@@ -67,6 +69,24 @@ $(OBJ_DIR)/bfs_compressed_kernels.o: $(SRC_DIR)/legacy/v3_shared/bfs_compressed_
 
 $(OBJ_DIR)/bfs_compressed_adaptive.o: $(SRC_DIR)/v4_1_hybrid/bfs_compressed_adaptive.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
+
+# Version 1: Dynamic Thread Assignment
+v1: dirs $(V1_BIN)
+
+$(V1_BIN): $(COMMON_OBJS) $(OBJ_DIR)/bfs_dynamic.o
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
+
+$(OBJ_DIR)/bfs_dynamic.o: $(SRC_DIR)/legacy/v1_dynamic/bfs_dynamic.cu
+	$(NVCC) $(NVCC_FLAGS) -I$(SRC_DIR)/legacy/v1_dynamic -c -o $@ $<
+
+# Version 2: Chunk-Based Processing
+v2: dirs $(V2_BIN)
+
+$(V2_BIN): $(COMMON_OBJS) $(OBJ_DIR)/bfs_chunked.o
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
+
+$(OBJ_DIR)/bfs_chunked.o: $(SRC_DIR)/legacy/v2_chunked/bfs_chunked.cu
+	$(NVCC) $(NVCC_FLAGS) -I$(SRC_DIR)/legacy/v2_chunked -c -o $@ $<
 
 $(OBJ_DIR)/afforest.o: $(SRC_DIR)/v4_1_hybrid/afforest.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
