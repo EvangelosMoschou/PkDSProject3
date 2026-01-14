@@ -3,6 +3,7 @@
 #include <chrono>
 #include <queue>
 #include <stdio.h>
+#include <string>
 #include <vector>
 
 // Standalone CPU BFS for benchmarking
@@ -59,7 +60,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  benchCPU(graph, 0);
+  int source = 0;
+  for (int i = 2; i < argc; i++) {
+    if (std::string(argv[i]) == "--source" && i + 1 < argc) {
+      source = std::atoi(argv[++i]);
+    }
+  }
+
+  benchCPU(graph, source);
 
   freeGraph(graph);
   return 0;

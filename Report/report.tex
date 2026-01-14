@@ -210,35 +210,34 @@ The 26.1x speedup over CPU is achieved through:
 
 It is important to note that the absolute performance (and thus the speedup) on Friendster is strictly bounded by the PCIe bus bandwidth. The compressed graph occupies \textbf{9.13 GB}, which exceeds the GPU's \textbf{5.8 GB VRAM}. Consequently, the GPU must stream data from system RAM during traversal.
 
-\subsection{VRAM-Resident Graph Analysis}
-To quantify the algorithmic speedup without the PCIe bottleneck, we benchmarked a synthetic random graph (20M nodes, 200M edges, 2.0GB total) that fits entirely in VRAM.
+\subsection{VRAM-Resident Graph: The Diameter Bottleneck}
+To quantify algorithmic speedup without the PCIe bottleneck, we benchmarked a synthetic random graph (40M nodes, 400M edges, 2.5GB) that fits entirely in VRAM. However, theoretical "Uniform Random" generation on sparse graphs (Avg Degree 10) creates a "stringy" topology with a massive diameter (36,710), presenting a \textbf{pathological case} for massive parallelism.
 
 \begin{table}[H]
 \centering
 \begin{tabular}{lccc}
 \toprule
-\textbf{Version} & \textbf{Time (ms)} & \textbf{Speedup} & \textbf{Observation} \\
+\textbf{Version} & \textbf{Time (ms)} & \textbf{Diameter} & \textbf{Observation} \\
 \midrule
-Sequential CPU & 5,278 & 1.0x & Baseline \\
-V2 Chunked & 475 & 11.1x & High serialization overhead \\
-V3.3 Compressed & 381 & 13.8x & Decompression overhead dominates \\
-V1 Dynamic & 279 & 18.9x & Low overhead, massive parallelism \\
-\textbf{V3.1 Shared} & \textbf{191} & \textbf{27.6x} & \textbf{Optimal for small/uniform graphs} \\
+Sequential CPU & \textbf{825} & 36,710 & \textbf{Fastest (Low Latency)} \\
+V1 Dynamic & 1,265 & 36,710 & Kernel Launch Overhead \\
+V3.1 Shared & 839 & 36,710 & Matches CPU \\
+V3.3 Compressed & 4,101 & 36,710 & High Overhead per Level \\
 \bottomrule
 \end{tabular}
-\caption{BFS Performance on VRAM-Resident Graph (20M nodes)}
+\caption{Performance on High-Diameter Sparse Graph (40M nodes)}
 \end{table}
 
-The results lead to a critical insight: \textbf{Complexity implies Overhead}. On this smaller, uniform-degree graph (Avg=10) that fits in memory:
+This result provides a crucial counter-intuitive insight: \textbf{GPUs require parallelism, not just bandwidth}.
 \begin{itemize}
-    \item \textbf{V1 (Dynamic)} outperforms V3.3 because the simple global atomic queue has minimal instruction overhead compared to the complex hybrid logic and Varint decompression of V3.3.
-    \item \textbf{V3.1 (Shared)} is the fastest (191ms) because it combines the low overhead of V1 with Warp-Aggregation, reducing the number of global atomic adds by $\approx$30x compared to V1.
-    \item \textbf{V3.3 (Compressed)} is slower here (381ms) because bandwidth is \textit{not} the bottleneck (data is in VRAM), so the compute cost of decompression becomes a net negative.
+    \item \textbf{Kernel Overhead}: With a diameter of 36,710, the GPU must launch over 36,000 kernels. At $\approx$10$\mu$s per launch, the pure overhead is $\approx$360ms, nearly 40\% of the runtime.
+    \item \textbf{Sequentiality}: The "frontier" at each level is small (often just a few nodes), causing most of the 1024 threads in a block to idle.
+    \item \textbf{CPU Advantage}: The CPU processes this sequential chain efficiently in L1/L2 cache without synchronization overhead, actually beating V1 and V3.3.
 \end{itemize}
 
-This confirms that our advanced optimizations (Compression, Hybrid) are specifically targeted at \textbf{Massive, Sparse, Power-Law Graphs} (like Friendster) where memory bandwidth and load imbalance are the primary constraints. For smaller uniform graphs, simpler solvers (V1/V3.1) are superior.
+This contrasts sharply with \textbf{Friendster} (Diameter $\approx$14), where the frontier contains millions of nodes, allowing the GPU to saturate 3500+ cores and achieve a \textbf{26x speedup}. Thus, our solvers are optimized for \textbf{Massive, Low-Diameter (Small World) Networks}, which represent real-world social graphs.
 
-Afforest remains bandwidth-bound due to its random atomic linking pattern, which cannot exploit the structured traversal of BFS.
+Afforest remains bandwidth-bound due to its random atomic linking pattern.
 
 % ------------------------------------------------------------------------------
 % Section 5: Afforest (Connected Components)
