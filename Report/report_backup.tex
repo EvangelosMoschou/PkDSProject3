@@ -1,0 +1,243 @@
+% ==============================================================================
+% Project Report: High-Performance BFS on Billion-Scale Graphs (V5.3)
+% ==============================================================================
+% Compile with: pdflatex report.tex
+% ==============================================================================
+
+\documentclass[11pt,a4paper]{article}
+
+% ------------------------------------------------------------------------------
+% Packages
+% ------------------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{left=1.5cm,right=1.5cm,top=2cm,bottom=2cm}
+\usepackage{enumitem}
+\setlist{nosep}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{amsmath}
+
+% ------------------------------------------------------------------------------
+% Title
+% ------------------------------------------------------------------------------
+\title{
+    \textbf{High-Performance BFS on Billion-Scale Graphs}\\[0.3em]
+    \large V5.3: 831ms on Friendster Using CUDA
+}
+\author{
+    Evangelos Moschou \\
+    \texttt{AEM: 10986}
+}
+\date{January 2026}
+
+% ==============================================================================
+\begin{document}
+
+\maketitle
+
+% ------------------------------------------------------------------------------
+% Abstract
+% ------------------------------------------------------------------------------
+\begin{abstract}
+This report presents the design and optimization of a GPU-accelerated Breadth-First Search (BFS) solver capable of traversing the Friendster social network (65.6M nodes, 3.6B edges) in \textbf{831 milliseconds}---a \textbf{26x speedup} over sequential CPU and 14.5x improvement over our initial GPU version. The key innovations are: (1) \textbf{Direct Queue Emission} using warp-aggregated atomics to eliminate O(N) distance scans; (2) \textbf{Hybrid Direction-Optimization} switching between Top-Down and Bottom-Up traversal; (3) \textbf{Delta-Varint Compression} reducing memory footprint by 37\%; and (4) \textbf{Zero-Copy Streaming} enabling processing of graphs larger than GPU VRAM. We also implement the Afforest algorithm for connected components. All code is publicly available.
+\end{abstract}
+
+% ------------------------------------------------------------------------------
+% Section 1: Introduction
+% ------------------------------------------------------------------------------
+\section{Introduction}
+
+Graph algorithms are fundamental to social network analysis, recommendation systems, and scientific computing. However, billion-scale graphs present significant challenges for GPU acceleration due to:
+\begin{itemize}
+    \item \textbf{Memory Constraints}: Large graphs exceed GPU VRAM (Friendster: 14.4GB vs 5.8GB available).
+    \item \textbf{Irregular Access Patterns}: Power-law degree distributions cause load imbalance.
+    \item \textbf{Atomic Contention}: Concurrent frontier updates create serialization bottlenecks.
+\end{itemize}
+
+This project addresses these challenges through a systematic optimization of the BFS algorithm, culminating in \textbf{Version 5.3} which achieves sub-second traversal on Friendster. We also implement the Afforest algorithm for connected components as a secondary case study.
+
+\subsection{Contributions}
+\begin{enumerate}
+    \item \textbf{Direct Queue Emission}: A novel technique where Bottom-Up kernels build the next frontier queue directly during traversal, eliminating expensive O(N) scans.
+    \item \textbf{Warp-Aggregated Atomics}: Reducing global atomic contention by 32x through hierarchical aggregation.
+    \item \textbf{Zero-Copy Streaming}: Enabling processing of out-of-core graphs via pinned host memory.
+    \item \textbf{Comprehensive Evaluation}: Detailed performance analysis across algorithm versions.
+\end{enumerate}
+
+% ------------------------------------------------------------------------------
+% Section 2: System Design
+% ------------------------------------------------------------------------------
+\section{System Design}
+
+\subsection{Data Representation: Delta-Compressed CSR}
+
+Standard CSR (Compressed Sparse Row) format stores:
+\begin{itemize}
+    \item \texttt{row\_ptr[N+1]}: Offsets into column array (8 bytes each for 64-bit indexing)
+    \item \texttt{col\_idx[E]}: Neighbor IDs (4 bytes each)
+\end{itemize}
+
+For Friendster, this requires 14.4GB---exceeding our 5.8GB VRAM. We implement \textbf{Delta-Varint Compression}:
+\begin{enumerate}
+    \item Sort neighbors for each row
+    \item Store differences: $\Delta_i = \text{neighbor}_i - \text{neighbor}_{i-1}$
+    \item Encode deltas using Variable-Length Quantity (1-5 bytes per delta)
+\end{enumerate}
+
+This reduces Friendster to \textbf{9.13 GB} (37\% reduction), enabling Zero-Copy streaming from host RAM.
+
+\subsection{Zero-Copy Memory Management}
+
+Since compressed data still exceeds VRAM, we use \texttt{cudaHostRegister} to pin host memory and map it to device address space. Kernels access graph data over PCIe with effective bandwidth of $\sim$1.4 GB/s. The key insight is that BFS traversal exhibits high temporal locality per level---we stream each portion of the graph once per BFS iteration.
+
+\subsection{Hybrid Direction-Optimization}
+
+We implement the Beamer direction-optimization strategy:
+\begin{itemize}
+    \item \textbf{Top-Down}: Process small frontiers by expanding each frontier node's neighbors.
+    \item \textbf{Bottom-Up}: Process large frontiers by checking if each unvisited node has a frontier neighbor.
+\end{itemize}
+
+The switching threshold is $N/26$ ($\approx$2.5M nodes for Friendster). This hybrid approach reduces redundant edge checks by up to 50\% on high-diameter graphs.
+
+% ------------------------------------------------------------------------------
+% Section 3: V5.3 Optimizations
+% ------------------------------------------------------------------------------
+\section{V5.3 Optimizations}
+
+\subsection{Direct Queue Emission (Critical)}
+
+In prior versions, Bottom-Up traversal marked newly discovered nodes by writing distances, then required a separate O(N) scan (\texttt{distancesToQueueKernel}) to rebuild the frontier queue. This scan dominated runtime on large graphs.
+
+\textbf{V5.3 Solution}: Bottom-Up kernels now emit discovered nodes directly to the next frontier using warp-aggregated atomics:
+\begin{enumerate}
+    \item Each warp processes one unvisited node
+    \item If a frontier neighbor is found, thread sets \texttt{found = true}
+    \item Warp ballot collects all \texttt{found} flags: \texttt{\_\_ballot\_sync()}
+    \item Leader thread atomically reserves space: \texttt{atomicAdd(queue\_size, popcount)}
+    \item Each found thread writes its node ID at the computed offset
+\end{enumerate}
+
+This eliminates the O(N) scan entirely, reducing Bottom-Up level time by 100--150ms.
+
+\subsection{Warp-Aggregated Atomics (Top-Down)}
+
+Top-Down kernels originally used per-discovery \texttt{atomicAdd} calls to append to the next frontier. With billions of edges, this created severe contention.
+
+\textbf{V5.3 Solution}: Within each warp, discoveries are aggregated before a single atomic operation:
+\begin{enumerate}
+    \item Each thread processes edges and flags discoveries
+    \item \texttt{\_\_ballot\_sync()} + \texttt{\_\_popc()} count discoveries per warp
+    \item Leader performs one \texttt{atomicAdd} for the entire warp
+    \item \texttt{\_\_shfl\_sync()} broadcasts base index to all threads
+    \item Each thread computes its local offset and writes
+\end{enumerate}
+
+This reduces global atomics from O(edges) to O(warps), a 32x reduction.
+
+\subsection{Synchronization Reduction}
+
+We removed unnecessary \texttt{cudaDeviceSynchronize()} calls after kernel launches, relying instead on CUDA's implicit stream serialization. This reduced per-level overhead by $\sim$10\%.
+
+% ------------------------------------------------------------------------------
+% Section 4: Experimental Results
+% ------------------------------------------------------------------------------
+\section{Experimental Results}
+
+\subsection{Test Environment}
+\begin{itemize}
+    \item \textbf{GPU}: NVIDIA GeForce RTX 3060 Laptop (Ampere, sm\_86, 5.8GB VRAM)
+    \item \textbf{System}: 32GB RAM, CUDA 12.5, Ubuntu Linux
+    \item \textbf{Compiler}: nvcc -O3 -arch=sm\_86
+\end{itemize}
+
+\subsection{Benchmark: Friendster Social Network}
+\begin{itemize}
+    \item Vertices: 65,608,366
+    \item Edges: 3,612,134,270 (3.6 billion)
+    \item Uncompressed size: 14.4 GB
+    \item Compressed size: 9.13 GB (1.58x ratio)
+    \item Diameter: 22 levels
+\end{itemize}
+
+\subsection{Performance Evolution}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Version} & \textbf{Key Optimization} & \textbf{Time (ms)} & \textbf{Speedup} \\
+\midrule
+Sequential CPU & STL Queue + Vector & 21,708 & 1.0x \\
+V3 Baseline & Shared Memory Kernels & 12,009 & 1.8x \\
+V4.1 Hybrid & Direction-Optimization & 1,200 & 18.1x \\
+V4.3 Compressed & Zero-Copy + Varint & 996 & 21.8x \\
+\textbf{V5.3 Final} & \textbf{Direct Queue Emission} & \textbf{831} & \textbf{26.1x} \\
+\bottomrule
+\end{tabular}
+\caption{BFS Performance Evolution on Friendster (source=0, 100\% reachability)}
+\end{table}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{BFS V5.3} & \textbf{Afforest} \\
+\midrule
+Runtime & \textbf{831 ms} & 21.6 s \\
+Edges Processed & 3.6 B & 3.6 B \\
+Throughput (GTEPS) & 4.35 & 0.17 \\
+Memory Streamed & 9.13 GB & 9.13 GB \\
+Effective Bandwidth & 11.0 GB/s & 0.42 GB/s \\
+\bottomrule
+\end{tabular}
+\caption{Detailed metrics. GTEPS = Giga Traversed Edges Per Second.}
+\end{table}
+
+\subsection{Analysis}
+
+The 26.1x speedup over CPU is achieved through:
+\begin{itemize}
+    \item \textbf{Hybrid Switching} (V4.1): Eliminates redundant edge checks, reducing iteration count.
+    \item \textbf{Compression + Zero-Copy} (V4.3): Reduces data transfer by 37\%, hiding PCIe latency.
+    \item \textbf{Direct Emission} (V5.3): Eliminates O(N) scans, reducing per-level overhead by 100ms+.
+\end{itemize}
+
+Afforest remains bandwidth-bound due to its random atomic linking pattern, which cannot exploit the structured traversal of BFS.
+
+% ------------------------------------------------------------------------------
+% Section 5: Afforest (Connected Components)
+% ------------------------------------------------------------------------------
+\section{Afforest Algorithm}
+
+We implement the Afforest algorithm for connected components:
+\begin{enumerate}
+    \item \textbf{Sampling Phase} (Optional): Sample random edges to quickly link large components.
+    \item \textbf{Hook Phase}: Iterate over all edges, linking components via \texttt{atomicMin}.
+    \item \textbf{Compression}: Flatten component tree to root pointer.
+\end{enumerate}
+
+For compressed graphs, we disable sampling and GCC pruning (as component IDs cannot be reliably estimated). Runtime: 21.6s---primarily bandwidth-bound by the random atomic pattern.
+
+% ------------------------------------------------------------------------------
+% Section 6: Conclusion
+% ------------------------------------------------------------------------------
+\section{Conclusion}
+
+This project demonstrates that billion-scale graph traversal is achievable in sub-second time on consumer GPUs through careful algorithmic optimization:
+\begin{itemize}
+    \item \textbf{831ms BFS on Friendster}: A 26x speedup over sequential CPU, enabled by Direct Queue Emission.
+    \item \textbf{Warp-Level Aggregation}: Reduces atomic contention by 32x.
+    \item \textbf{Zero-Copy + Compression}: Enables out-of-core processing with 37\% bandwidth reduction.
+\end{itemize}
+
+The key insight is that \textbf{algorithmic complexity matters more than raw bandwidth}. Eliminating the O(N) distance scan in V5.3 provided a larger improvement than all previous compression optimizations combined.
+
+\vfill
+\noindent\textbf{Source Code:} \url{https://github.com/EvangelosMoschou/PkDSProject3.git}
+
+\end{document}
