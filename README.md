@@ -58,22 +58,50 @@ Union-Find with optional neighbor sampling for fast convergence on social graphs
 ## Building
 
 ```bash
-make all          # Build all versions
-make v3           # Build V5.3 Hybrid Solver (recommended)
+make all          # Build v5 executable: bin/bfs_v5_multi_gpu
+make v41          # Build v4.1 hybrid executable: bin/bfs_v4_1_hybrid
 make clean        # Clean build files
+```
+
+### Compiler Optimization Modes
+
+`Makefile` now supports native tuning, optional LTO, and optional PGO:
+
+```bash
+# Native host tuning (default enabled)
+make v41 HOST_NATIVE=1
+
+# Native + LTO
+make v41 HOST_NATIVE=1 ENABLE_LTO=1
+
+# Portable build (disable native)
+make v41 HOST_NATIVE=0
+```
+
+PGO workflow (2-phase):
+
+```bash
+# 1) Build with instrumentation
+make pgo-gen
+
+# 2) Run representative workload(s)
+bin/bfs_v4_1_hybrid "Mat Files/road_usa.bin" --compress
+
+# 3) Rebuild using collected profiles
+make pgo-use
 ```
 
 ## Usage
 
 ```bash
 # Standard BFS (Uncompressed, for graphs < VRAM)
-./bin/bfs_v3 --algo adaptive -s 0 <graph_file>
+./bin/bfs_v4_1_hybrid <graph_file> -s 0
 
 # Compressed BFS (Zero-Copy, for graphs > VRAM)
-./bin/bfs_v3 --algo adaptive --compress -s 0 <graph_file>
+./bin/bfs_v4_1_hybrid <graph_file> --compress -s 0
 
 # Afforest (Connected Components)
-./bin/bfs_v3 --algo afforest --compress <graph_file>
+./bin/bfs_v4_1_hybrid <graph_file> --algo afforest --compress
 ```
 
 ### Supported Graph Formats

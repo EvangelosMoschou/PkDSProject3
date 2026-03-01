@@ -14,9 +14,16 @@ fi
 # Print CUDA version
 echo "CUDA version: $(nvcc --version | grep release)"
 
+HOST_NATIVE="${HOST_NATIVE:-1}"
+ENABLE_LTO="${ENABLE_LTO:-0}"
+PGO="${PGO:-off}"
+
+echo "Build options: HOST_NATIVE=${HOST_NATIVE} ENABLE_LTO=${ENABLE_LTO} PGO=${PGO}"
+
 # Build all versions
 make clean
-make all
+make all HOST_NATIVE="${HOST_NATIVE}" ENABLE_LTO="${ENABLE_LTO}" PGO="${PGO}"
+make v41 HOST_NATIVE="${HOST_NATIVE}" ENABLE_LTO="${ENABLE_LTO}" PGO="${PGO}"
 
 echo ""
 echo "Build complete! Executables:"
@@ -24,6 +31,5 @@ ls -la bin/
 
 echo ""
 echo "Usage:"
-echo "  ./bin/bfs_v1 <graph_file> -s <source>   # Dynamic Thread Assignment"
-echo "  ./bin/bfs_v2 <graph_file> -s <source>   # Chunk-Based Processing"
-echo "  ./bin/bfs_v3 <graph_file> -s <source>   # Shared Memory + Warp Cooperation"
+echo "  ./bin/bfs_v5_multi_gpu <graph_file>"
+echo "  ./bin/bfs_v4_1_hybrid <graph_file> --compress -s 0"

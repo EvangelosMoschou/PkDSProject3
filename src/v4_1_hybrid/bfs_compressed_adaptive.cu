@@ -1,14 +1,18 @@
 #define CUDA_ATOMICS_IMPL
 // Restoration of Legacy Kernels (Best Performance: 996ms)
 // Restoration of Legacy Kernels (Best Performance: 996ms)
-#include "../legacy/v3_shared/bfs_compressed_kernel.cuh" // Legacy Prototypes
+#include "../v5_multi_gpu/bfs_compressed_kernel.cuh" // Legacy Prototypes
 #define BFS_KERNELS_SKIP_DEFINITIONS
 #include "bfs_kernels.cuh"
 #include "cuda_common.h"
 #include "graph.h"
 #include "utils.h"
+#include <algorithm>
 
 #define THREAD_QUEUE_LIMIT 32
+#define COMPRESSED_BU_THRESHOLD_DIVISOR 32
+#define COMPRESSED_BU_BLOCKS_PER_SM 8
+#define COMPRESSED_CLASSIFY_THREADS 1024
 
 // Classifier Kernel for Compressed Graph
 // Classifier Kernel for Compressed Graph with Hierarchical Atomics (V4.2)
@@ -188,13 +192,14 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
   // Allocations
   level_t *d_distances;
   node_t *d_frontier, *d_next_frontier;
-  int *d_frontier_size,
-      *d_next_frontier_size; /* d_frontier_size unused in hybrid? */
+  int *d_next_frontier_size;
   int *d_next_frontier_cnt;  // Pointer alias for clarity
 
   // Adaptive Queues
   node_t *d_q_small, *d_q_large;
-  int *d_count_small, *d_count_large;
+  int *d_counts;
+  int *d_count_small;
+  int *d_count_large;
 
   // Bitmaps for Bottom-Up
   int bitmap_ints = (num_nodes + 31) / 32;
@@ -203,6 +208,7 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
   // Host vars
   int h_frontier_size;
   int h_count_small, h_count_large;
+  int h_counts[2] = {0, 0};
 
   // 1. Setup Memory
   // Distances
@@ -218,8 +224,9 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
   // Queues
   CUDA_CHECK(cudaMalloc((void **)&d_q_small, num_nodes * sizeof(node_t)));
   CUDA_CHECK(cudaMalloc((void **)&d_q_large, num_nodes * sizeof(node_t)));
-  CUDA_CHECK(cudaMalloc((void **)&d_count_small, sizeof(int)));
-  CUDA_CHECK(cudaMalloc((void **)&d_count_large, sizeof(int)));
+  CUDA_CHECK(cudaMalloc((void **)&d_counts, 2 * sizeof(int)));
+  d_count_small = d_counts;
+  d_count_large = d_counts + 1;
 
   // Bitmaps
   CUDA_CHECK(
@@ -246,24 +253,33 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
   // Tuning: Aggressive Bottom-Up for Compressed (V4.3 Best Speed: 996ms)
   // Bu_Threshold = N/26 (2.5M) forces L5 (3M) and above to Bottom-Up.
   // This avoids the slow Top-Down decoding for large frontiers.
-  int bu_threshold = num_nodes / 26;
+  int bu_threshold = num_nodes / COMPRESSED_BU_THRESHOLD_DIVISOR;
 
-  printf("Starting Compressed BFS (Hybrid V5.1). Threshold: %d\n",
-         bu_threshold);
+  cudaDeviceProp prop;
+  CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+  int bu_threads = 256;
+  int max_bu_blocks = std::max(1, prop.multiProcessorCount *
+                                      COMPRESSED_BU_BLOCKS_PER_SM);
+
+  int td_threads = 256;
+  int classify_threads = COMPRESSED_CLASSIFY_THREADS;
+  int warps_per_block = 32;
+
+  // printf("Starting Compressed BFS (Hybrid V5.1). Threshold: %d\n",
+  //        bu_threshold);
 
   while (h_frontier_size > 0) {
     CUDA_CHECK(cudaMemset(d_next_frontier_size, 0, sizeof(int)));
 
     if (h_frontier_size > bu_threshold) {
       // === BOTTOM-UP COMPRESSED ===
-      printf("Level %d: [BOTTOM-UP] frontier=%d\n", level, h_frontier_size);
+      // printf("Level %d: [BOTTOM-UP] frontier=%d\n", level, h_frontier_size);
 
       // 1. Convert Queue to Bitmap
       clearBitmapKernel<<<(bitmap_ints + 255) / 256, 256>>>(d_frontier_bitmap,
                                                             bitmap_ints);
       queueToBitmapKernel<<<(h_frontier_size + 255) / 256, 256>>>(
           d_frontier, h_frontier_size, d_frontier_bitmap);
-      CUDA_CHECK(cudaDeviceSynchronize());
 
       // 2. Visited Bitmap (Skipped: Direct check is faster for compressed)
       // clearBitmapKernel... (Removed)
@@ -271,9 +287,9 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
 
       // 3. Kernel
       // 3. Kernel (Now emits queue directly)
-      int threads = 256;
-      int blocks = (num_nodes + threads - 1) / threads;
-      bfsCompressedBottomUpKernel<<<blocks, threads>>>(
+        int blocks = (num_nodes + bu_threads - 1) / bu_threads;
+        blocks = std::min(blocks, max_bu_blocks);
+        bfsCompressedBottomUpKernel<<<blocks, bu_threads>>>(
           graph->d_row_Ptr, graph->d_compressed_col, d_distances,
           d_frontier_bitmap, d_next_frontier_size, d_next_frontier, level,
           num_nodes);
@@ -289,39 +305,35 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
     } else {
       // === TOP-DOWN COMPRESSED ===
       // Reset Queue Counts
-      CUDA_CHECK(cudaMemset(d_count_small, 0, sizeof(int)));
-      CUDA_CHECK(cudaMemset(d_count_large, 0, sizeof(int)));
+      CUDA_CHECK(cudaMemset(d_counts, 0, 2 * sizeof(int)));
 
       // 1. Classify
-      int threads = 256;
-      int blocks = (h_frontier_size + threads - 1) / threads;
-      classifyCompressedFrontierKernel<<<blocks, threads>>>(
+      int blocks = (h_frontier_size + classify_threads - 1) / classify_threads;
+      classifyCompressedFrontierKernel<<<blocks, classify_threads>>>(
           d_frontier, h_frontier_size, graph->d_row_Ptr, d_q_small,
           d_count_small, d_q_large, d_count_large);
 
       // Read back
-      CUDA_CHECK(cudaMemcpy(&h_count_small, d_count_small, sizeof(int),
+      CUDA_CHECK(cudaMemcpy(h_counts, d_counts, 2 * sizeof(int),
                             cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(&h_count_large, d_count_large, sizeof(int),
-                            cudaMemcpyDeviceToHost));
-      printf("Level %d: [TOP-DOWN] Size %d. Sm: %d, Lg: %d\n", level,
-             h_frontier_size, h_count_small, h_count_large);
+      h_count_small = h_counts[0];
+      h_count_large = h_counts[1];
+      // printf("Level %d: [TOP-DOWN] Size %d. Sm: %d, Lg: %d\n", level,
+//             h_frontier_size, h_count_small, h_count_large);
 
       // 2. Dispatch
       if (h_count_small > 0) {
-        int sm_blocks = (h_count_small + threads - 1) / threads;
-        bfsCompressedThreadKernel<<<sm_blocks, threads>>>(
+        int sm_blocks = (h_count_small + td_threads - 1) / td_threads;
+        bfsCompressedThreadKernel<<<sm_blocks, td_threads>>>(
             graph->d_row_Ptr, graph->d_compressed_col, d_distances, d_q_small,
             h_count_small, d_next_frontier, d_next_frontier_size, level);
       }
       if (h_count_large > 0) {
-        int warps_per_block = 32;
         int lg_blocks = (h_count_large + warps_per_block - 1) / warps_per_block;
         bfsCompressedWarpKernel<<<lg_blocks, 1024>>>(
             graph->d_row_Ptr, graph->d_compressed_col, d_distances, d_q_large,
             h_count_large, d_next_frontier, d_next_frontier_size, level);
       }
-      CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     // Update size
@@ -350,8 +362,7 @@ BFSResult *solveBFSCompressedAdaptive(CompressedCSRGraph *graph,
   CUDA_CHECK(cudaFree(d_next_frontier_size));
   CUDA_CHECK(cudaFree(d_q_small));
   CUDA_CHECK(cudaFree(d_q_large));
-  CUDA_CHECK(cudaFree(d_count_small));
-  CUDA_CHECK(cudaFree(d_count_large));
+  CUDA_CHECK(cudaFree(d_counts));
   CUDA_CHECK(cudaFree(d_frontier_bitmap));
   // CUDA_CHECK(cudaFree(d_visited_bitmap)); removed
 
