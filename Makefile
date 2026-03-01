@@ -1,5 +1,6 @@
 # =============================================================================
-# Project 3: Parallel BFS using CUDA - Makefile
+# Project 3 -> Project 4: Parallel BFS using CUDA - Makefile
+# V5 Multi-GPU
 # =============================================================================
 
 # Compiler
@@ -17,7 +18,8 @@ HDF5_INC = -I/usr/include/hdf5/serial
 HDF5_LIB = -L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5_serial
 
 # CUDA flags
-NVCC_FLAGS = -std=c++14 -O3 -arch=sm_86
+# NOTE: Added -Xcompiler -fopenmp to support OpenMP local multithreading
+NVCC_FLAGS = -std=c++14 -O3 -arch=sm_86 -Xcompiler -fopenmp
 NVCC_FLAGS += -I$(INC_DIR) -I$(SRC_DIR)/common $(HDF5_INC)
 
 # Debug flags (uncomment for debugging)
@@ -28,67 +30,67 @@ LDFLAGS = -L/usr/local/cuda/lib64 -lcudart $(HDF5_LIB)
 
 # Source files
 COMMON_SRCS = $(SRC_DIR)/common/graph.cu $(SRC_DIR)/common/utils.cu $(SRC_DIR)/common/json_gpu.cu $(SRC_DIR)/common/io_utils.cu $(SRC_DIR)/common/compression.cu
-V3_SRCS = $(SRC_DIR)/legacy/v3_shared/bfs_shared.cu $(SRC_DIR)/v4_adaptive/bfs_adaptive.cu
+V5_SRCS = $(SRC_DIR)/main_multi_gpu.cu $(SRC_DIR)/v5_multi_gpu/bfs_multi_gpu.cu $(SRC_DIR)/v5_multi_gpu/bfs_compressed_multi_gpu.cu $(SRC_DIR)/v5_multi_gpu/afforest_multi_gpu.cu $(SRC_DIR)/v5_multi_gpu/bfs_compressed_kernels.cu
 
-# Object files
+# Object files (Common)
 COMMON_OBJS = $(OBJ_DIR)/graph.o $(OBJ_DIR)/utils.o $(OBJ_DIR)/json_gpu.o $(OBJ_DIR)/io_utils.o $(OBJ_DIR)/compression.o
-V3_OBJS = $(OBJ_DIR)/bfs_shared.o $(OBJ_DIR)/bfs_adaptive.o \
-          $(OBJ_DIR)/bfs_compressed_kernels.o $(OBJ_DIR)/bfs_compressed_adaptive.o \
-          $(OBJ_DIR)/afforest.o
+
+# Object files (V5)
+V5_OBJS = $(OBJ_DIR)/main_multi_gpu.o $(OBJ_DIR)/bfs_multi_gpu.o $(OBJ_DIR)/bfs_compressed_multi_gpu.o $(OBJ_DIR)/afforest_multi_gpu.o $(OBJ_DIR)/bfs_compressed_kernels.o
+
+# Object files (V4.1) - NOTE: compressed_adaptive excluded (missing legacy header)
+V41_OBJS = $(OBJ_DIR)/main_v41.o $(OBJ_DIR)/bfs_adaptive_v41.o $(OBJ_DIR)/afforest_v41.o
 
 # Executables
-V1_BIN = $(BIN_DIR)/bfs_v1
-V2_BIN = $(BIN_DIR)/bfs_v2
-V3_BIN = $(BIN_DIR)/bfs_v3
+V5_BIN = $(BIN_DIR)/bfs_v5_multi_gpu
+V41_BIN = $(BIN_DIR)/bfs_v4_1_hybrid
 
 # =============================================================================
 # Targets
 # =============================================================================
 
-.PHONY: all v3 clean dirs
+.PHONY: all clean dirs v41
 
-all: dirs v3 v1 v2
+all: dirs $(V5_BIN)
+
+v41: dirs $(V41_BIN)
 
 dirs:
 	@mkdir -p $(BIN_DIR) $(OBJ_DIR)
 
-# Version 3: Production Build (Adaptive BFS + Compressed BFS + Afforest)
-v3: dirs $(V3_BIN)
-
-$(V3_BIN): $(COMMON_OBJS) $(V3_OBJS)
+# Version 5: Multi-GPU Development Build
+$(V5_BIN): $(COMMON_OBJS) $(V5_OBJS)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
 
-$(OBJ_DIR)/bfs_shared.o: $(SRC_DIR)/legacy/v3_shared/bfs_shared.cu
+$(OBJ_DIR)/main_multi_gpu.o: $(SRC_DIR)/main_multi_gpu.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/bfs_adaptive.o: $(SRC_DIR)/v4_1_hybrid/bfs_adaptive.cu
+$(OBJ_DIR)/bfs_multi_gpu.o: $(SRC_DIR)/v5_multi_gpu/bfs_multi_gpu.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/bfs_compressed_kernels.o: $(SRC_DIR)/legacy/v3_shared/bfs_compressed_kernels.cu
+$(OBJ_DIR)/bfs_compressed_multi_gpu.o: $(SRC_DIR)/v5_multi_gpu/bfs_compressed_multi_gpu.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/bfs_compressed_adaptive.o: $(SRC_DIR)/v4_1_hybrid/bfs_compressed_adaptive.cu
+$(OBJ_DIR)/bfs_compressed_kernels.o: $(SRC_DIR)/v5_multi_gpu/bfs_compressed_kernels.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-# Version 1: Dynamic Thread Assignment
-v1: dirs $(V1_BIN)
+$(OBJ_DIR)/afforest_multi_gpu.o: $(SRC_DIR)/v5_multi_gpu/afforest_multi_gpu.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(V1_BIN): $(COMMON_OBJS) $(OBJ_DIR)/bfs_dynamic.o
+# Version 4.1: Hybrid Build
+$(V41_BIN): $(COMMON_OBJS) $(V41_OBJS)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
 
-$(OBJ_DIR)/bfs_dynamic.o: $(SRC_DIR)/legacy/v1_dynamic/bfs_dynamic.cu
-	$(NVCC) $(NVCC_FLAGS) -I$(SRC_DIR)/legacy/v1_dynamic -c -o $@ $<
+$(OBJ_DIR)/main_v41.o: $(SRC_DIR)/main_multi_gpu.cu
+	$(NVCC) $(NVCC_FLAGS) -DUSE_V41_HYBRID -c -o $@ $<
 
-# Version 2: Chunk-Based Processing
-v2: dirs $(V2_BIN)
+$(OBJ_DIR)/bfs_adaptive_v41.o: $(SRC_DIR)/v4_1_hybrid/bfs_adaptive.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(V2_BIN): $(COMMON_OBJS) $(OBJ_DIR)/bfs_chunked.o
-	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(LDFLAGS)
+$(OBJ_DIR)/bfs_compressed_adaptive_v41.o: $(SRC_DIR)/v4_1_hybrid/bfs_compressed_adaptive.cu
+	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/bfs_chunked.o: $(SRC_DIR)/legacy/v2_chunked/bfs_chunked.cu
-	$(NVCC) $(NVCC_FLAGS) -I$(SRC_DIR)/legacy/v2_chunked -c -o $@ $<
-
-$(OBJ_DIR)/afforest.o: $(SRC_DIR)/v4_1_hybrid/afforest.cu
+$(OBJ_DIR)/afforest_v41.o: $(SRC_DIR)/v4_1_hybrid/afforest.cu
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ $<
 
 # Common objects
@@ -124,11 +126,8 @@ clean:
 # Help
 help:
 	@echo "Available targets:"
-	@echo "  all          - Build production version (v3)"
-	@echo "  v3           - Build v3 (Adaptive BFS + Compressed BFS + Afforest)"
+	@echo "  all          - Build Multi-GPU version (v5)"
 	@echo "  reorder_graph - Build graph reordering tool"
 	@echo "  clean        - Remove build files"
 	@echo "  help         - Show this help message"
 	@echo ""
-	@echo "Legacy versions (v1, v2) are archived in src/legacy/"
-

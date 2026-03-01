@@ -387,47 +387,14 @@ void freeGraphDevice(CSRGraph *graph) {
 }
 
 void setupCompressedGraphDevice(CompressedCSRGraph *graph) {
-  // We assume h_row_Ptr and h_compressed_col are already PINNED
-  // (allocated via cudaMallocHost in compressGraph).
-
-  // 1. Get Device Pointer for Row Pointers
-  // Note: cudaMallocHost memory is technically accessible, but getDevicePointer
-  // is safer for strict ZC. Actually, cudaMallocHost returns a pointer valid on
-  // both if portable? Standard practice: check definition. Let's rely on
-  // cudaHostGetDevicePointer to be sure.
-
+  // Zero-Copy: map pinned host memory into device address space.
+  // cudaHostGetDevicePointer is safe to call multiple times.
   CUDA_CHECK(cudaHostGetDevicePointer((void **)&graph->d_row_Ptr,
                                       (void *)graph->h_row_Ptr, 0));
-
-  // 2. Get Device Pointer for Compressed Data
-  // This buffer was reused from input->h_col_idx (pinned) or allocated new
-  // pinned. If it was reused from input graph which was registered? If
-  // compressGraphInPlace reused it, it's pinned. We need to ensure it's mapped.
-  // cudaHostRegister might be needed if it wasn't mapped?
-  // Since compressGraphInPlace reuses the buffer from loadGraph, and loadGraph
-  // uses cudaMallocHost... cudaMallocHost memory is implicitly mapped on many
-  // systems, but let's explicit register if needed? Error: cannot register
-  // already registered memory. Safe bet: Just get device pointer.
-
   CUDA_CHECK(cudaHostGetDevicePointer((void **)&graph->d_compressed_col,
                                       (void *)graph->h_compressed_col, 0));
 
   printf("Compressed Graph Mapped to Device (Zero-Copy).\n");
-
-  // Prefetch/Advise
-  // int deviceId = 0;
-  // Compress rows are accessed randomly, so ReadMostly is good.
-  // Note: cudaMemAdvise fails on Pinned Host Memory (Zero-Copy) if not Managed.
-  /*
-  CUDA_CHECK(cudaMemAdvise(graph->d_row_Ptr,
-                           (graph->num_nodes + 1) * sizeof(edge_t),
-                           cudaMemAdviseSetReadMostly, deviceId));
-  // Compressed data is accessed sequentially-ish (by warp), but effectively
-  // random access.
-  CUDA_CHECK(cudaMemAdvise(graph->d_compressed_col,
-                           graph->compressed_size_bytes,
-                           cudaMemAdviseSetReadMostly, deviceId));
-  */
 }
 
 void freeGraph(CSRGraph *graph) {

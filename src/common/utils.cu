@@ -159,6 +159,7 @@ BFSOptions parseArgs(int argc, char **argv) {
   opts.compression = false;
   opts.algorithm = ALGO_BFS;
   opts.bu_threshold_divisor = 20; // Default: 5% of nodes triggers Bottom-Up
+  opts.num_gpus = 1;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
@@ -200,6 +201,12 @@ BFSOptions parseArgs(int argc, char **argv) {
         if (opts.bu_threshold_divisor <= 0)
           opts.bu_threshold_divisor = 20;
       }
+    } else if (strcmp(argv[i], "--gpus") == 0) {
+      if (i + 1 < argc) {
+        opts.num_gpus = atoi(argv[++i]);
+        if (opts.num_gpus <= 0)
+          opts.num_gpus = 1;
+      }
     } else if (argv[i][0] != '-') {
       opts.graph_file = argv[i];
     }
@@ -225,6 +232,8 @@ void printUsage(const char *program) {
   printf("  -v, --verbose        Enable verbose output\n");
   printf("  -n, --no-validate    Skip validation against CPU\n");
   printf("  -b, --benchmark <n>  Run benchmark with n iterations\n");
+  printf(
+      "  --gpus <n>           Number of simulated GPUs to use (default: 1)\n");
   printf("  --json               Output results in JSON format\n");
   printf("  --compress           Enable graph compression (Zero-Copy)\n");
   printf("  -h, --help           Show this help message\n");

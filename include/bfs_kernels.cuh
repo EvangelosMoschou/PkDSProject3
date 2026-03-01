@@ -239,6 +239,10 @@ extern __global__ void bfsBottomUpWarpKernel_Direct(
     const unsigned int *__restrict__ visited_bitmap,
     int *__restrict__ next_frontier_size, node_t *__restrict__ next_frontier,
     const level_t current_level, node_t num_nodes);
+extern __global__ void
+mergeIncomingQueues(node_t *incoming_queue, int incoming_size,
+                    level_t *distances, node_t *next_frontier,
+                    int *next_frontier_size, level_t current_level);
 #endif // BFS_KERNELS_SKIP_DEFINITIONS (declarations)
 
 #endif // BFS_KERNELS_CUH

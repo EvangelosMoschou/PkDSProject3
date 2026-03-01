@@ -94,6 +94,7 @@ typedef struct {
   AlgorithmType algorithm;
   int bu_threshold_divisor; // Bottom-Up threshold = num_nodes /
                             // bu_threshold_divisor (default: 20 = 5%)
+  int num_gpus;             // Number of GPUs to mock/use (default: 1)
 } BFSOptions;
 
 /**
