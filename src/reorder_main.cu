@@ -38,7 +38,7 @@ int main(int argc, char *argv[]) {
   printf("\n");
 
   // Detect file type and load appropriately
-  CSRGraph *graph = nullptr;
+  CSRGraph *graph = NULL;
   const char *ext = strrchr(input_file, '.');
 
   if (ext && strcmp(ext, ".mat") == 0) {

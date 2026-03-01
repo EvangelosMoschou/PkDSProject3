@@ -6,9 +6,9 @@
 #else
 #include "v5_multi_gpu/bfs_multi_gpu.h"
 #endif
-#include <iostream>
+#include <stdio.h>
+#include <string.h>
 #include <omp.h>
-#include <vector>
 
 int main(int argc, char **argv) {
   printf("DEBUG: Main started\n");
@@ -17,41 +17,39 @@ int main(int argc, char **argv) {
   BFSOptions options = parseArgs(argc, argv);
 
   if (!options.graph_file) {
-    std::cerr << "Error: No graph file provided." << std::endl;
+    fprintf(stderr, "Error: No graph file provided.\n");
     printUsage(argv[0]);
     return 1;
   }
 
 #ifdef USE_V41_HYBRID
-  std::cout << "=================================================" << std::endl;
-  std::cout << " V4.1 Hybrid-Optimized Adaptive BFS / Afforest   " << std::endl;
-  std::cout << "=================================================" << std::endl;
+  printf("=================================================\n");
+  printf(" V4.1 Hybrid-Optimized Adaptive BFS / Afforest   \n");
+  printf("=================================================\n");
 #else
-  std::cout << "=================================================" << std::endl;
-  std::cout << " V5 Multi-GPU (Locally Simulated) BFS / Afforest " << std::endl;
-  std::cout << "=================================================" << std::endl;
+  printf("=================================================\n");
+  printf(" V5 Multi-GPU (Locally Simulated) BFS / Afforest \n");
+  printf("=================================================\n");
 #endif
 
   // 2. Load the graph
-  std::cout << "Loading graph from " << options.graph_file << "..."
-            << std::endl;
-  CSRGraph *graph = nullptr;
+  printf("Loading graph from %s...\n", options.graph_file);
+  CSRGraph *graph = NULL;
 
   // Auto-detect extension or use default logic. For now use base Loader.
   // In your actual code you might switch on .bin vs .mtx, etc.
   // We'll use the .bin if it ends in bin, else try standard loadGraph.
-  std::string filename(options.graph_file);
-  if (filename.find(".bin") != std::string::npos) {
+  if (strstr(options.graph_file, ".bin") != NULL) {
     graph = loadGraphCSRBin(options.graph_file);
-  } else if (filename.find(".h5") != std::string::npos ||
-             filename.find(".mat") != std::string::npos) {
+  } else if (strstr(options.graph_file, ".h5") != NULL ||
+             strstr(options.graph_file, ".mat") != NULL) {
     graph = loadGraphHDF5(options.graph_file);
   } else {
     graph = loadGraph(options.graph_file);
   }
 
   if (!graph) {
-    std::cerr << "Failed to load graph." << std::endl;
+    fprintf(stderr, "Failed to load graph.\n");
     return 1;
   }
 
@@ -64,45 +62,43 @@ int main(int argc, char **argv) {
   if (options.algorithm == ALGO_AFFOREST) {
     solveAfforest(graph);
   } else {
-    BFSResult *result = nullptr;
+    BFSResult *result = NULL;
     if (options.compression) {
 #ifdef USE_V41_HYBRID
-      std::cerr
-          << "Compressed BFS not available in V4.1. Running standard BFS..."
-          << std::endl;
+      fprintf(stderr,
+              "Compressed BFS not available in V4.1. Running standard BFS...\n");
       result = solveBFSAdaptiveWithThreshold(graph, options.source,
                                              options.bu_threshold_divisor);
 #else
-      std::cout << "\nCompressing Graph (c-CSR)..." << std::endl;
+      printf("\nCompressing Graph (c-CSR)...\n");
       CompressedCSRGraph comp_graph;
       compressGraph(graph, &comp_graph);
       setupCompressedGraphDevice(&comp_graph);
 
       if (options.num_gpus > 1) {
-        std::cout << "Running V5 Simulated Multi-GPU BFS (Compressed, "
-                  << options.num_gpus << " GPUs)..." << std::endl;
+        printf("Running V5 Simulated Multi-GPU BFS (Compressed, %d GPUs)...\n",
+               options.num_gpus);
         result = solveBFSCompressedMultiGPUSimulated(
             &comp_graph, options.source, options.num_gpus);
       } else {
-        std::cout << "Running Adaptive BFS (Compressed Single GPU)..."
-                  << std::endl;
+        printf("Running Adaptive BFS (Compressed Single GPU)...\n");
         result = solveBFSCompressedAdaptive(&comp_graph, options.source);
       }
 #endif
     } else if (options.num_gpus > 1) {
 #ifdef USE_V41_HYBRID
-      std::cerr << "Multi-GPU not supported in V4.1. Running single GPU..."
-                << std::endl;
+      fprintf(stderr,
+              "Multi-GPU not supported in V4.1. Running single GPU...\n");
       result = solveBFSAdaptiveWithThreshold(graph, options.source,
                                              options.bu_threshold_divisor);
 #else
-      std::cout << "\nRunning V5 Simulated Multi-GPU BFS (" << options.num_gpus
-                << " GPUs)..." << std::endl;
+      printf("\nRunning V5 Simulated Multi-GPU BFS (%d GPUs)...\n",
+             options.num_gpus);
       result =
           solveBFSMultiGPUSimulated(graph, options.source, options.num_gpus);
 #endif
     } else {
-      std::cout << "\nRunning Adaptive BFS (Single GPU)..." << std::endl;
+      printf("\nRunning Adaptive BFS (Single GPU)...\n");
       result = solveBFSAdaptiveWithThreshold(graph, options.source,
                                              options.bu_threshold_divisor);
     }
@@ -111,14 +107,12 @@ int main(int argc, char **argv) {
       printBFSResult(result);
 
       if (options.validate) {
-        std::cout << "Validating result against CPU..." << std::endl;
+        printf("Validating result against CPU...\n");
         bool valid = validateBFSResult(result, graph);
         if (valid) {
-          std::cout << "[SUCCESS] GPU Result matches CPU reference."
-                    << std::endl;
+          printf("[SUCCESS] GPU Result matches CPU reference.\n");
         } else {
-          std::cout << "[FAILED] GPU Result does NOT match CPU reference."
-                    << std::endl;
+          printf("[FAILED] GPU Result does NOT match CPU reference.\n");
         }
       }
       freeBFSResult(result);
@@ -126,7 +120,7 @@ int main(int argc, char **argv) {
   }
 
   freeGraph(graph);
-  std::cout << "Done." << std::endl;
+  printf("Done.\n");
 
   return 0;
 }

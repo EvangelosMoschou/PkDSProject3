@@ -1,29 +1,40 @@
 #include "common/graph.h"
 #include "common/utils.h"
-#include <chrono>
-#include <queue>
+#include <stdint.h>
 #include <stdio.h>
-#include <string>
-#include <vector>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 // Standalone CPU BFS for benchmarking
 void benchCPU(const CSRGraph *graph, int source) {
   printf("Starting CPU BFS (Source: %d)...\n", source);
 
-  // Use std::vector for distances (faster than new/delete raw array for C++)
-  std::vector<int> distances(graph->num_nodes, -1);
-  std::queue<int> q;
+  int *distances = (int *)malloc((size_t)graph->num_nodes * sizeof(int));
+  node_t *queue = (node_t *)malloc((size_t)graph->num_nodes * sizeof(node_t));
+  if (!distances || !queue) {
+    fprintf(stderr, "Allocation failed in CPU benchmark.\n");
+    free(distances);
+    free(queue);
+    return;
+  }
+  for (node_t i = 0; i < graph->num_nodes; i++) {
+    distances[i] = -1;
+  }
 
-  auto start_time = std::chrono::high_resolution_clock::now();
+  struct timespec start_time;
+  struct timespec end_time;
+  clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-  q.push(source);
+  node_t head = 0;
+  node_t tail = 0;
+  queue[tail++] = (node_t)source;
   distances[source] = 0;
 
   node_t visited_count = 1;
 
-  while (!q.empty()) {
-    node_t u = q.front();
-    q.pop();
+  while (head < tail) {
+    node_t u = queue[head++];
 
     int dist_new = distances[u] + 1;
     edge_t start = graph->h_row_ptr[u];
@@ -33,18 +44,23 @@ void benchCPU(const CSRGraph *graph, int source) {
       node_t v = graph->h_col_idx[e];
       if (distances[v] == -1) {
         distances[v] = dist_new;
-        q.push(v);
+        queue[tail++] = v;
         visited_count++;
       }
     }
   }
 
-  auto end_time = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
+  clock_gettime(CLOCK_MONOTONIC, &end_time);
+  double elapsed_ms =
+      (double)(end_time.tv_sec - start_time.tv_sec) * 1000.0 +
+      (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
 
   printf("CPU BFS Completed.\n");
-  printf("Time: %.2f ms\n", elapsed.count());
+  printf("Time: %.2f ms\n", elapsed_ms);
   printf("Visited: %d nodes\n", visited_count);
+
+  free(distances);
+  free(queue);
 }
 
 int main(int argc, char **argv) {
@@ -62,8 +78,8 @@ int main(int argc, char **argv) {
 
   int source = 0;
   for (int i = 2; i < argc; i++) {
-    if (std::string(argv[i]) == "--source" && i + 1 < argc) {
-      source = std::atoi(argv[++i]);
+    if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
+      source = atoi(argv[++i]);
     }
   }
 

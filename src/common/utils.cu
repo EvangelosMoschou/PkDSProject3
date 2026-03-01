@@ -1,6 +1,6 @@
 #include "utils.h"
 #include <cstring>
-#include <queue>
+#include <stdlib.h>
 
 // =============================================================================
 // Timer Implementation
@@ -35,13 +35,19 @@ void destroyTimer(CudaTimer *timer) {
 // =============================================================================
 
 BFSResult *allocBFSResult(node_t num_nodes, node_t source) {
-  BFSResult *result = new BFSResult;
+  BFSResult *result = (BFSResult *)malloc(sizeof(BFSResult));
+  if (!result)
+    return NULL;
   result->num_nodes = num_nodes;
   result->source = source;
   result->elapsed_ms = 0.0f;
 
-  result->distances = new level_t[num_nodes];
-  result->parents = nullptr; // Optional, allocate if needed
+  result->distances = (level_t *)malloc((size_t)num_nodes * sizeof(level_t));
+  if (!result->distances) {
+    free(result);
+    return NULL;
+  }
+  result->parents = NULL;
 
   // Initialize distances to unvisited
   for (node_t i = 0; i < num_nodes; i++) {
@@ -55,10 +61,10 @@ BFSResult *allocBFSResult(node_t num_nodes, node_t source) {
 void freeBFSResult(BFSResult *result) {
   if (!result)
     return;
-  delete[] result->distances;
+  free(result->distances);
   if (result->parents)
-    delete[] result->parents;
-  delete result;
+    free(result->parents);
+  free(result);
 }
 
 void printBFSResult(const BFSResult *result) {
@@ -118,13 +124,20 @@ bool validateBFSResult(const BFSResult *result, const CSRGraph *graph) {
 
 BFSResult *bfsCPU(const CSRGraph *graph, node_t source) {
   BFSResult *result = allocBFSResult(graph->num_nodes, source);
+  if (!result)
+    return NULL;
 
-  std::queue<node_t> frontier;
-  frontier.push(source);
+  node_t *frontier = (node_t *)malloc((size_t)graph->num_nodes * sizeof(node_t));
+  if (!frontier) {
+    freeBFSResult(result);
+    return NULL;
+  }
+  node_t head = 0;
+  node_t tail = 0;
+  frontier[tail++] = source;
 
-  while (!frontier.empty()) {
-    node_t current = frontier.front();
-    frontier.pop();
+  while (head < tail) {
+    node_t current = frontier[head++];
 
     level_t current_dist = result->distances[current];
 
@@ -135,10 +148,12 @@ BFSResult *bfsCPU(const CSRGraph *graph, node_t source) {
 
       if (result->distances[neighbor] == UNVISITED) {
         result->distances[neighbor] = current_dist + 1;
-        frontier.push(neighbor);
+        frontier[tail++] = neighbor;
       }
     }
   }
+
+  free(frontier);
 
   return result;
 }
@@ -149,7 +164,7 @@ BFSResult *bfsCPU(const CSRGraph *graph, node_t source) {
 
 BFSOptions parseArgs(int argc, char **argv) {
   BFSOptions opts;
-  opts.graph_file = nullptr;
+  opts.graph_file = NULL;
   opts.source = 0;
   opts.validate = true;
   opts.verbose = false;

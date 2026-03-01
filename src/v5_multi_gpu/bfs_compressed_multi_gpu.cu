@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <omp.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define THREAD_QUEUE_LIMIT 32
 
@@ -386,24 +388,26 @@ BFSResult *solveBFSCompressedMultiGPUSimulated(CompressedCSRGraph *graph,
 
   level_t *distances;
   CUDA_CHECK(cudaMallocManaged(&distances, num_nodes * sizeof(level_t)));
-  std::fill(distances, distances + num_nodes, UNVISITED);
+  for (node_t i = 0; i < num_nodes; i++)
+    distances[i] = UNVISITED;
 
   int source_gpu = source / nodes_per_gpu;
   if (source_gpu >= num_gpus)
     source_gpu = num_gpus - 1;
   distances[source] = 0;
 
-  node_t **frontiers = new node_t *[num_gpus];
-  node_t **next_frontiers = new node_t *[num_gpus];
-  int **d_next_frontier_sizes = new int *[num_gpus];
-  int *h_frontier_sizes = new int[num_gpus];
-  std::fill(h_frontier_sizes, h_frontier_sizes + num_gpus, 0);
+  node_t **frontiers = (node_t **)malloc((size_t)num_gpus * sizeof(node_t *));
+  node_t **next_frontiers = (node_t **)malloc((size_t)num_gpus * sizeof(node_t *));
+  int **d_next_frontier_sizes = (int **)malloc((size_t)num_gpus * sizeof(int *));
+  int *h_frontier_sizes = (int *)malloc((size_t)num_gpus * sizeof(int));
+  for (int i = 0; i < num_gpus; i++)
+    h_frontier_sizes[i] = 0;
   h_frontier_sizes[source_gpu] = 1;
 
-  node_t ***msg_queues = new node_t **[num_gpus];
-  int ***d_msg_queue_sizes = new int **[num_gpus];
-  node_t ***d_ptr_msg_queues = new node_t **[num_gpus];
-  int ***d_ptr_msg_queue_sizes = new int **[num_gpus];
+  node_t ***msg_queues = (node_t ***)malloc((size_t)num_gpus * sizeof(node_t **));
+  int ***d_msg_queue_sizes = (int ***)malloc((size_t)num_gpus * sizeof(int **));
+  node_t ***d_ptr_msg_queues = (node_t ***)malloc((size_t)num_gpus * sizeof(node_t **));
+  int ***d_ptr_msg_queue_sizes = (int ***)malloc((size_t)num_gpus * sizeof(int **));
 
   for (int i = 0; i < num_gpus; i++) {
     CUDA_CHECK(cudaMallocManaged(&frontiers[i], num_nodes * sizeof(node_t)));
@@ -411,8 +415,8 @@ BFSResult *solveBFSCompressedMultiGPUSimulated(CompressedCSRGraph *graph,
         cudaMallocManaged(&next_frontiers[i], num_nodes * sizeof(node_t)));
     CUDA_CHECK(cudaMallocManaged(&d_next_frontier_sizes[i], sizeof(int)));
 
-    msg_queues[i] = new node_t *[num_gpus];
-    d_msg_queue_sizes[i] = new int *[num_gpus];
+    msg_queues[i] = (node_t **)malloc((size_t)num_gpus * sizeof(node_t *));
+    d_msg_queue_sizes[i] = (int **)malloc((size_t)num_gpus * sizeof(int *));
     for (int j = 0; j < num_gpus; j++) {
       CUDA_CHECK(
           cudaMallocManaged(&msg_queues[i][j], num_nodes * sizeof(node_t)));
@@ -497,13 +501,36 @@ BFSResult *solveBFSCompressedMultiGPUSimulated(CompressedCSRGraph *graph,
   }
 
   double end_time = omp_get_wtime();
-  BFSResult *res = new BFSResult;
+  BFSResult *res = (BFSResult *)malloc(sizeof(BFSResult));
   res->elapsed_ms = (float)((end_time - start_time) * 1000.0);
   res->num_nodes = num_nodes;
   res->source = source;
-  res->distances = new level_t[num_nodes];
-  std::copy(distances, distances + num_nodes, res->distances);
+  res->distances = (level_t *)malloc((size_t)num_nodes * sizeof(level_t));
+  res->parents = NULL;
+  memcpy(res->distances, distances, (size_t)num_nodes * sizeof(level_t));
 
-  // Partial Cleanup (managed memory leaks are okay in simulation prototype)
+  CUDA_CHECK(cudaFree(distances));
+  for (int i = 0; i < num_gpus; i++) {
+    CUDA_CHECK(cudaFree(frontiers[i]));
+    CUDA_CHECK(cudaFree(next_frontiers[i]));
+    CUDA_CHECK(cudaFree(d_next_frontier_sizes[i]));
+    CUDA_CHECK(cudaFree(d_ptr_msg_queues[i]));
+    CUDA_CHECK(cudaFree(d_ptr_msg_queue_sizes[i]));
+    for (int j = 0; j < num_gpus; j++) {
+      CUDA_CHECK(cudaFree(msg_queues[i][j]));
+      CUDA_CHECK(cudaFree(d_msg_queue_sizes[i][j]));
+    }
+    free(msg_queues[i]);
+    free(d_msg_queue_sizes[i]);
+  }
+  free(frontiers);
+  free(next_frontiers);
+  free(d_next_frontier_sizes);
+  free(h_frontier_sizes);
+  free(msg_queues);
+  free(d_msg_queue_sizes);
+  free(d_ptr_msg_queues);
+  free(d_ptr_msg_queue_sizes);
+
   return res;
 }

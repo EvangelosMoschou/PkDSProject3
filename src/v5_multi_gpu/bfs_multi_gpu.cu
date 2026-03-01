@@ -11,6 +11,8 @@
 #include "bfs_kernels.cuh"
 #include "bfs_multi_gpu.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define THREAD_QUEUE_LIMIT 32
 #define WARP_QUEUE_LIMIT 1024
@@ -381,12 +383,12 @@ BFSResult *solveBFSAdaptiveWithThreshold(CSRGraph *graph, node_t source,
 
   float elapsed = stopTimer(&timer);
 
-  BFSResult *res = new BFSResult;
+  BFSResult *res = (BFSResult *)malloc(sizeof(BFSResult));
   res->elapsed_ms = elapsed;
   res->num_nodes = num_nodes;
   res->source = source;
-  res->distances = new level_t[num_nodes];
-  res->parents = nullptr;
+  res->distances = (level_t *)malloc((size_t)num_nodes * sizeof(level_t));
+  res->parents = NULL;
 
   CUDA_CHECK(cudaMemcpy(res->distances, d_distances,
                         num_nodes * sizeof(level_t), cudaMemcpyDeviceToHost));
@@ -495,32 +497,32 @@ BFSResult *solveBFSMultiGPUSimulated(CSRGraph *graph, node_t source, int num_gpu
     level_t zero = 0;
     cudaMemcpy(&distances[source], &zero, sizeof(level_t), cudaMemcpyHostToDevice);
 
-    int *frontier_sizes = new int[num_gpus];
+    int *frontier_sizes = (int *)malloc((size_t)num_gpus * sizeof(int));
     for(int i=0; i<num_gpus; i++) frontier_sizes[i] = 0;
     
     int source_gpu = source / nodes_per_gpu;
     if (source_gpu >= num_gpus) source_gpu = num_gpus - 1;
     frontier_sizes[source_gpu] = 1;
 
-    node_t **frontiers = new node_t*[num_gpus];
-    node_t **next_frontiers = new node_t*[num_gpus];
-    int **d_next_frontier_sizes = new int*[num_gpus];
+    node_t **frontiers = (node_t **)malloc((size_t)num_gpus * sizeof(node_t *));
+    node_t **next_frontiers = (node_t **)malloc((size_t)num_gpus * sizeof(node_t *));
+    int **d_next_frontier_sizes = (int **)malloc((size_t)num_gpus * sizeof(int *));
 
     // msg_queues[sender][receiver] -> pointer to buffer
-    node_t ***msg_queues = new node_t**[num_gpus];
-    int ***d_msg_queue_sizes = new int**[num_gpus];
+    node_t ***msg_queues = (node_t ***)malloc((size_t)num_gpus * sizeof(node_t **));
+    int ***d_msg_queue_sizes = (int ***)malloc((size_t)num_gpus * sizeof(int **));
     
     // Device-resident pointers to above message arrays so kernel can index them
-    node_t ***d_ptr_msg_queues = new node_t**[num_gpus];
-    int ***d_ptr_msg_queue_sizes = new int**[num_gpus];
+    node_t ***d_ptr_msg_queues = (node_t ***)malloc((size_t)num_gpus * sizeof(node_t **));
+    int ***d_ptr_msg_queue_sizes = (int ***)malloc((size_t)num_gpus * sizeof(int **));
 
     for (int i = 0; i < num_gpus; i++) {
         cudaMallocManaged(&frontiers[i], num_nodes * sizeof(node_t)); // oversized to avoid overflow
         cudaMallocManaged(&next_frontiers[i], num_nodes * sizeof(node_t));
         cudaMallocManaged(&d_next_frontier_sizes[i], sizeof(int));
         
-        msg_queues[i] = new node_t*[num_gpus];
-        d_msg_queue_sizes[i] = new int*[num_gpus];
+        msg_queues[i] = (node_t **)malloc((size_t)num_gpus * sizeof(node_t *));
+        d_msg_queue_sizes[i] = (int **)malloc((size_t)num_gpus * sizeof(int *));
         for (int j = 0; j < num_gpus; j++) {
             // Memory heavily over-provisioned for simulation prototype
             cudaMallocManaged(&msg_queues[i][j], num_nodes * sizeof(node_t)); 
@@ -624,12 +626,12 @@ BFSResult *solveBFSMultiGPUSimulated(CSRGraph *graph, node_t source, int num_gpu
 
     double elapsed_ms = (omp_get_wtime() - start_time) * 1000.0;
 
-    BFSResult *res = new BFSResult;
+    BFSResult *res = (BFSResult *)malloc(sizeof(BFSResult));
     res->elapsed_ms = elapsed_ms;
     res->num_nodes = num_nodes;
     res->source = source;
-    res->distances = new level_t[num_nodes];
-    res->parents = nullptr;
+    res->distances = (level_t *)malloc((size_t)num_nodes * sizeof(level_t));
+    res->parents = NULL;
     
     // Copy computed distances back from unified memory array to result struct
     memcpy(res->distances, distances, num_nodes * sizeof(level_t));
@@ -646,17 +648,17 @@ BFSResult *solveBFSMultiGPUSimulated(CSRGraph *graph, node_t source, int num_gpu
             cudaFree(msg_queues[i][j]);
             cudaFree(d_msg_queue_sizes[i][j]);
         }
-        delete[] msg_queues[i];
-        delete[] d_msg_queue_sizes[i];
+        free(msg_queues[i]);
+        free(d_msg_queue_sizes[i]);
     }
-    delete[] frontiers;
-    delete[] next_frontiers;
-    delete[] d_next_frontier_sizes;
-    delete[] msg_queues;
-    delete[] d_msg_queue_sizes;
-    delete[] d_ptr_msg_queues;
-    delete[] d_ptr_msg_queue_sizes;
-    delete[] frontier_sizes;
+      free(frontiers);
+      free(next_frontiers);
+      free(d_next_frontier_sizes);
+      free(msg_queues);
+      free(d_msg_queue_sizes);
+      free(d_ptr_msg_queues);
+      free(d_ptr_msg_queue_sizes);
+      free(frontier_sizes);
 
     return res;
 }

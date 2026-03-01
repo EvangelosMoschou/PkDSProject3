@@ -2,7 +2,7 @@
 #define GRAPH_H
 
 #include "cuda_common.h"
-#include <cstdint>
+#include <stdint.h>
 
 // =============================================================================
 // CSR Graph Structure

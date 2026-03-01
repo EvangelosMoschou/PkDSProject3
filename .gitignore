@@ -14,6 +14,8 @@ Mat Files/*
 *.mat
 *.csrbin
 *.h5
+data/
+
 
 # OS generated files
 .DS_Store

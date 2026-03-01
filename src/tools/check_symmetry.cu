@@ -1,9 +1,8 @@
 #include "common/graph.h"
-#include <iostream>
-#include <set>
+#include <stdio.h>
 
 bool isSymmetric(CSRGraph *graph) {
-  std::cout << "Checking symmetry..." << std::endl;
+  printf("Checking symmetry...\n");
   for (node_t u = 0; u < graph->num_nodes; u++) {
     for (edge_t e = graph->h_row_ptr[u]; e < graph->h_row_ptr[u + 1]; e++) {
       node_t v = graph->h_col_idx[e];
@@ -17,8 +16,8 @@ bool isSymmetric(CSRGraph *graph) {
         }
       }
       if (!found) {
-        std::cout << "Missing reverse edge: (" << v << ", " << u
-                  << ") for edge (" << u << ", " << v << ")" << std::endl;
+        printf("Missing reverse edge: (%d, %d) for edge (%d, %d)\n", v, u, u,
+               v);
         return false;
       }
     }
@@ -33,8 +32,9 @@ int main(int argc, char **argv) {
   if (!graph)
     return 1;
   if (isSymmetric(graph))
-    std::cout << "Graph is SYMMETRIC" << std::endl;
+    printf("Graph is SYMMETRIC\n");
   else
-    std::cout << "Graph is ASYMMETRIC" << std::endl;
+    printf("Graph is ASYMMETRIC\n");
+  freeGraph(graph);
   return 0;
 }
