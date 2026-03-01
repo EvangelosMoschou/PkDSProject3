@@ -1,16 +1,39 @@
 #include "cuda_common.h"
 #include "reorder.h"
-#include <algorithm>
-#include <iostream>
-#include <queue>
 #include <stdio.h>
 #include <stdlib.h>
-#include <vector>
+#include <string.h>
 
-using namespace std;
+typedef struct {
+  edge_t degree;
+  node_t node;
+} DegreeNode;
 
-// Helper: Get max degree node (good BFS starting point)
-node_t findMaxDegreeNode(const CSRGraph *g) {
+static int compare_node_t_asc(const void *a, const void *b) {
+  node_t va = *(const node_t *)a;
+  node_t vb = *(const node_t *)b;
+  if (va < vb)
+    return -1;
+  if (va > vb)
+    return 1;
+  return 0;
+}
+
+static int compare_degree_desc(const void *a, const void *b) {
+  const DegreeNode *da = (const DegreeNode *)a;
+  const DegreeNode *db = (const DegreeNode *)b;
+  if (da->degree > db->degree)
+    return -1;
+  if (da->degree < db->degree)
+    return 1;
+  if (da->node < db->node)
+    return -1;
+  if (da->node > db->node)
+    return 1;
+  return 0;
+}
+
+static node_t findMaxDegreeNode(const CSRGraph *g) {
   node_t max_node = 0;
   edge_t max_deg = 0;
   for (node_t i = 0; i < g->num_nodes; i++) {
@@ -23,171 +46,176 @@ node_t findMaxDegreeNode(const CSRGraph *g) {
   return max_node;
 }
 
-// =============================================================================
-// Standard BFS Order (RCM-like, but without degree sorting or reversal)
-// =============================================================================
-void computeBFSOrder(const CSRGraph *graph, std::vector<node_t> &new_to_old,
-                     std::vector<node_t> &old_to_new) {
-  node_t N = graph->num_nodes;
-  std::fill(old_to_new.begin(), old_to_new.end(), (node_t)-1);
-  std::fill(new_to_old.begin(), new_to_old.end(), (node_t)-1);
+static void initOrderArrays(node_t *new_to_old, node_t *old_to_new, node_t n) {
+  for (node_t i = 0; i < n; i++) {
+    new_to_old[i] = (node_t)-1;
+    old_to_new[i] = (node_t)-1;
+  }
+}
 
-  vector<bool> visited(N, false);
-  queue<node_t> q;
+static void computeBFSOrder(const CSRGraph *graph, node_t *new_to_old,
+                            node_t *old_to_new) {
+  node_t n = graph->num_nodes;
+  initOrderArrays(new_to_old, old_to_new, n);
+
+  unsigned char *visited = (unsigned char *)calloc((size_t)n, sizeof(unsigned char));
+  node_t *queue = (node_t *)malloc((size_t)n * sizeof(node_t));
+  if (!visited || !queue) {
+    free(visited);
+    free(queue);
+    return;
+  }
+
+  node_t head = 0;
+  node_t tail = 0;
   node_t new_id_counter = 0;
-
   node_t start_node = findMaxDegreeNode(graph);
-  q.push(start_node);
-  visited[start_node] = true;
+  queue[tail++] = start_node;
+  visited[start_node] = 1;
 
-  while (new_id_counter < N) {
-    if (q.empty()) {
-      for (node_t i = 0; i < N; i++) {
+  while (new_id_counter < n) {
+    if (head >= tail) {
+      for (node_t i = 0; i < n; i++) {
         if (!visited[i]) {
-          q.push(i);
-          visited[i] = true;
+          queue[tail++] = i;
+          visited[i] = 1;
           break;
         }
       }
     }
-    if (q.empty())
+    if (head >= tail)
       break;
 
-    node_t u = q.front();
-    q.pop();
-
+    node_t u = queue[head++];
     node_t nid = new_id_counter++;
     old_to_new[u] = nid;
     new_to_old[nid] = u;
 
-    edge_t start = graph->h_row_ptr[u];
-    edge_t end = graph->h_row_ptr[u + 1];
-
-    for (edge_t e = start; e < end; e++) {
+    for (edge_t e = graph->h_row_ptr[u]; e < graph->h_row_ptr[u + 1]; e++) {
       node_t v = graph->h_col_idx[e];
       if (!visited[v]) {
-        visited[v] = true;
-        q.push(v);
+        visited[v] = 1;
+        queue[tail++] = v;
       }
     }
   }
+
+  free(visited);
+  free(queue);
 }
 
-// =============================================================================
-// Gap-Aware BFS Order
-// Key insight: Sort neighbors by ORIGINAL ID before enqueueing
-// This keeps nodes that were originally close together (small gaps)
-// assigned to consecutive new IDs, preserving compression efficiency
-// =============================================================================
-void computeGapAwareBFSOrder(const CSRGraph *graph,
-                             std::vector<node_t> &new_to_old,
-                             std::vector<node_t> &old_to_new) {
-  node_t N = graph->num_nodes;
-  std::fill(old_to_new.begin(), old_to_new.end(), (node_t)-1);
-  std::fill(new_to_old.begin(), new_to_old.end(), (node_t)-1);
+static void computeGapAwareBFSOrder(const CSRGraph *graph, node_t *new_to_old,
+                                    node_t *old_to_new) {
+  node_t n = graph->num_nodes;
+  initOrderArrays(new_to_old, old_to_new, n);
 
-  vector<bool> visited(N, false);
-  queue<node_t> q;
+  unsigned char *visited = (unsigned char *)calloc((size_t)n, sizeof(unsigned char));
+  node_t *queue = (node_t *)malloc((size_t)n * sizeof(node_t));
+  node_t *neighbors = NULL;
+  size_t neighbors_cap = 0;
+  if (!visited || !queue) {
+    free(visited);
+    free(queue);
+    return;
+  }
+
+  node_t head = 0;
+  node_t tail = 0;
   node_t new_id_counter = 0;
 
-  // Start from node 0 (often a good choice for preserving original locality)
-  // Alternatively, could use findMaxDegreeNode, but that might scatter things
-  node_t start_node = 0;
-  q.push(start_node);
-  visited[start_node] = true;
-
-  // Temporary buffer for sorting neighbors
-  vector<node_t> neighbors;
-  neighbors.reserve(10000); // Pre-allocate for efficiency
+  queue[tail++] = 0;
+  visited[0] = 1;
 
   printf("  Computing Gap-Aware BFS Order...\n");
 
-  while (new_id_counter < N) {
-    if (q.empty()) {
-      // Find unvisited node - pick the SMALLEST unvisited ID to preserve
-      // locality
-      for (node_t i = 0; i < N; i++) {
+  while (new_id_counter < n) {
+    if (head >= tail) {
+      for (node_t i = 0; i < n; i++) {
         if (!visited[i]) {
-          q.push(i);
-          visited[i] = true;
+          queue[tail++] = i;
+          visited[i] = 1;
           break;
         }
       }
     }
-    if (q.empty())
+    if (head >= tail)
       break;
 
-    node_t u = q.front();
-    q.pop();
-
+    node_t u = queue[head++];
     node_t nid = new_id_counter++;
     old_to_new[u] = nid;
     new_to_old[nid] = u;
 
-    // Collect unvisited neighbors
     edge_t start = graph->h_row_ptr[u];
     edge_t end = graph->h_row_ptr[u + 1];
+    size_t count = 0;
 
-    neighbors.clear();
     for (edge_t e = start; e < end; e++) {
       node_t v = graph->h_col_idx[e];
       if (!visited[v]) {
-        neighbors.push_back(v);
-        visited[v] = true; // Mark visited now to avoid duplicates
+        if (count >= neighbors_cap) {
+          size_t new_cap = neighbors_cap == 0 ? 1024 : neighbors_cap * 2;
+          node_t *tmp = (node_t *)realloc(neighbors, new_cap * sizeof(node_t));
+          if (!tmp) {
+            free(neighbors);
+            free(visited);
+            free(queue);
+            return;
+          }
+          neighbors = tmp;
+          neighbors_cap = new_cap;
+        }
+        neighbors[count++] = v;
+        visited[v] = 1;
       }
     }
 
-    // KEY DIFFERENCE: Sort neighbors by original ID (ascending)
-    // This ensures that nodes originally close together get consecutive new IDs
-    std::sort(neighbors.begin(), neighbors.end());
-
-    // Enqueue in sorted order
-    for (node_t v : neighbors) {
-      q.push(v);
+    if (count > 1) {
+      qsort(neighbors, count, sizeof(node_t), compare_node_t_asc);
+    }
+    for (size_t i = 0; i < count; i++) {
+      queue[tail++] = neighbors[i];
     }
 
-    // Progress indicator
     if (new_id_counter % 10000000 == 0) {
-      printf("    Processed %d / %d nodes (%.1f%%)\n", new_id_counter, N,
-             100.0 * new_id_counter / N);
+      printf("    Processed %d / %d nodes (%.1f%%)\n", new_id_counter, n,
+             100.0 * new_id_counter / n);
     }
   }
+
   printf("  Gap-Aware BFS Order complete.\n");
+  free(neighbors);
+  free(visited);
+  free(queue);
 }
 
-// =============================================================================
-// Degree Order (sort by degree descending)
-// =============================================================================
-void computeDegreeOrder(const CSRGraph *graph, std::vector<node_t> &new_to_old,
-                        std::vector<node_t> &old_to_new) {
-  node_t N = graph->num_nodes;
-  std::fill(old_to_new.begin(), old_to_new.end(), (node_t)-1);
-  std::fill(new_to_old.begin(), new_to_old.end(), (node_t)-1);
+static void computeDegreeOrder(const CSRGraph *graph, node_t *new_to_old,
+                               node_t *old_to_new) {
+  node_t n = graph->num_nodes;
+  initOrderArrays(new_to_old, old_to_new, n);
 
-  vector<pair<edge_t, node_t>> nodes(N);
-  for (node_t i = 0; i < N; i++) {
-    nodes[i] = {graph->h_row_ptr[i + 1] - graph->h_row_ptr[i], i};
+  DegreeNode *nodes = (DegreeNode *)malloc((size_t)n * sizeof(DegreeNode));
+  if (!nodes)
+    return;
+
+  for (node_t i = 0; i < n; i++) {
+    nodes[i].degree = graph->h_row_ptr[i + 1] - graph->h_row_ptr[i];
+    nodes[i].node = i;
   }
-  sort(nodes.rbegin(), nodes.rend());
 
-  for (node_t i = 0; i < N; i++) {
-    node_t old_id = nodes[i].second;
+  qsort(nodes, (size_t)n, sizeof(DegreeNode), compare_degree_desc);
+
+  for (node_t i = 0; i < n; i++) {
+    node_t old_id = nodes[i].node;
     old_to_new[old_id] = i;
     new_to_old[i] = old_id;
   }
+
+  free(nodes);
 }
 
-// =============================================================================
-// Streaming Implementation (Memory-efficient disk output)
-// =============================================================================
-void reorderAndSaveStreaming(const CSRGraph *graph, const char *out_filename,
-                             ReorderMethod method) {
-  printf("Reordering Graph: %d Nodes, %lld Edges. Method: %d\n",
-         graph->num_nodes, (long long)graph->num_edges, (int)method);
-
-  std::vector<node_t> new_to_old(graph->num_nodes);
-  std::vector<node_t> old_to_new(graph->num_nodes);
-
+static int computeOrder(const CSRGraph *graph, ReorderMethod method,
+                        node_t *new_to_old, node_t *old_to_new) {
   if (method == REORDER_BFS) {
     printf("  Computing Standard BFS Order...\n");
     computeBFSOrder(graph, new_to_old, old_to_new);
@@ -197,61 +225,99 @@ void reorderAndSaveStreaming(const CSRGraph *graph, const char *out_filename,
     printf("  Computing Degree Order...\n");
     computeDegreeOrder(graph, new_to_old, old_to_new);
   }
+  return 0;
+}
+
+void reorderAndSaveStreaming(const CSRGraph *graph, const char *out_filename,
+                             ReorderMethod method) {
+  printf("Reordering Graph: %d Nodes, %lld Edges. Method: %d\n",
+         graph->num_nodes, (long long)graph->num_edges, (int)method);
+
+  node_t *new_to_old = (node_t *)malloc((size_t)graph->num_nodes * sizeof(node_t));
+  node_t *old_to_new = (node_t *)malloc((size_t)graph->num_nodes * sizeof(node_t));
+  if (!new_to_old || !old_to_new) {
+    free(new_to_old);
+    free(old_to_new);
+    return;
+  }
+  computeOrder(graph, method, new_to_old, old_to_new);
 
   printf("  Streaming Reordered Graph to Disk: %s\n", out_filename);
   FILE *file = fopen(out_filename, "wb");
   if (!file) {
     fprintf(stderr, "Error: Cannot create file %s\n", out_filename);
+    free(new_to_old);
+    free(old_to_new);
     return;
   }
 
-  // Write header
   unsigned long long n = (unsigned long long)graph->num_nodes;
   unsigned long long m = (unsigned long long)graph->num_edges;
   fwrite(&n, sizeof(unsigned long long), 1, file);
   fwrite(&m, sizeof(unsigned long long), 1, file);
 
-  // Compute new row pointers
-  edge_t *new_row_ptr = new edge_t[graph->num_nodes + 1];
+  edge_t *new_row_ptr = (edge_t *)malloc((size_t)(graph->num_nodes + 1) * sizeof(edge_t));
+  if (!new_row_ptr) {
+    fclose(file);
+    free(new_to_old);
+    free(old_to_new);
+    return;
+  }
   new_row_ptr[0] = 0;
-
   for (node_t i = 0; i < graph->num_nodes; i++) {
     node_t u_old = new_to_old[i];
     edge_t degree = graph->h_row_ptr[u_old + 1] - graph->h_row_ptr[u_old];
     new_row_ptr[i + 1] = new_row_ptr[i] + degree;
   }
+  fwrite(new_row_ptr, sizeof(edge_t), (size_t)graph->num_nodes + 1, file);
 
-  fwrite(new_row_ptr, sizeof(edge_t), graph->num_nodes + 1, file);
-
-  // Stream column indices with sorting for better compression
-  size_t buffer_cap = 1024 * 1024 * 64;
-  node_t *buffer = new node_t[buffer_cap];
+  size_t buffer_cap = 1024 * 1024 * 16;
+  node_t *buffer = (node_t *)malloc(buffer_cap * sizeof(node_t));
+  node_t *row_neighbors = NULL;
+  size_t row_neighbors_cap = 0;
   size_t buffer_idx = 0;
 
-  vector<node_t> row_neighbors;
-  row_neighbors.reserve(10000);
+  if (!buffer) {
+    free(new_row_ptr);
+    fclose(file);
+    free(new_to_old);
+    free(old_to_new);
+    return;
+  }
 
   printf("  Streaming Edges... (Total: %lld)\n", (long long)m);
-
   for (node_t i = 0; i < graph->num_nodes; i++) {
     node_t u_old = new_to_old[i];
     edge_t start = graph->h_row_ptr[u_old];
     edge_t end = graph->h_row_ptr[u_old + 1];
+    size_t row_size = (size_t)(end - start);
 
-    // Collect and translate neighbors
-    row_neighbors.clear();
-    for (edge_t e = start; e < end; e++) {
-      node_t v_old = graph->h_col_idx[e];
-      node_t v_new = old_to_new[v_old];
-      row_neighbors.push_back(v_new);
+    if (row_size > row_neighbors_cap) {
+      node_t *tmp = (node_t *)realloc(row_neighbors, row_size * sizeof(node_t));
+      if (!tmp) {
+        free(row_neighbors);
+        free(buffer);
+        free(new_row_ptr);
+        fclose(file);
+        free(new_to_old);
+        free(old_to_new);
+        return;
+      }
+      row_neighbors = tmp;
+      row_neighbors_cap = row_size;
     }
 
-    // Sort neighbors by NEW ID for optimal delta compression
-    std::sort(row_neighbors.begin(), row_neighbors.end());
+    for (size_t j = 0; j < row_size; j++) {
+      node_t v_old = graph->h_col_idx[start + (edge_t)j];
+      row_neighbors[j] = old_to_new[v_old];
+    }
 
-    // Write to buffer
-    for (node_t v_new : row_neighbors) {
-      buffer[buffer_idx++] = v_new;
+    if (row_size > 1) {
+      qsort(row_neighbors, row_size, sizeof(node_t), compare_node_t_asc);
+    }
+
+    for (size_t j = 0; j < row_size; j++) {
+      buffer[buffer_idx++] = row_neighbors[j];
       if (buffer_idx >= buffer_cap) {
         fwrite(buffer, sizeof(node_t), buffer_cap, file);
         buffer_idx = 0;
@@ -270,14 +336,14 @@ void reorderAndSaveStreaming(const CSRGraph *graph, const char *out_filename,
   }
   printf("\n  Done.\n");
 
-  delete[] buffer;
-  delete[] new_row_ptr;
+  free(row_neighbors);
+  free(buffer);
+  free(new_row_ptr);
   fclose(file);
+  free(new_to_old);
+  free(old_to_new);
 }
 
-// =============================================================================
-// In-Memory Reorder (for smaller graphs or when memory permits)
-// =============================================================================
 CSRGraph *reorderGraph(const CSRGraph *graph, ReorderMethod method) {
   if (graph->num_edges > 1000000000LL) {
     fprintf(stderr, "WARNING: reorderGraph on massive graph. Use streaming.\n");
@@ -286,30 +352,34 @@ CSRGraph *reorderGraph(const CSRGraph *graph, ReorderMethod method) {
   printf("Reordering Graph: %d Nodes, %lld Edges. Method: %d\n",
          graph->num_nodes, (long long)graph->num_edges, (int)method);
 
-  std::vector<node_t> new_to_old(graph->num_nodes);
-  std::vector<node_t> old_to_new(graph->num_nodes);
-
-  if (method == REORDER_BFS) {
-    printf("  Computing Standard BFS Order...\n");
-    computeBFSOrder(graph, new_to_old, old_to_new);
-  } else if (method == REORDER_GAP_BFS) {
-    computeGapAwareBFSOrder(graph, new_to_old, old_to_new);
-  } else {
-    printf("  Computing Degree Order...\n");
-    computeDegreeOrder(graph, new_to_old, old_to_new);
+  node_t *new_to_old = (node_t *)malloc((size_t)graph->num_nodes * sizeof(node_t));
+  node_t *old_to_new = (node_t *)malloc((size_t)graph->num_nodes * sizeof(node_t));
+  if (!new_to_old || !old_to_new) {
+    free(new_to_old);
+    free(old_to_new);
+    return NULL;
   }
 
+  computeOrder(graph, method, new_to_old, old_to_new);
+
   printf("  Reconstructing Graph...\n");
-  CSRGraph *new_graph = new CSRGraph;
+  CSRGraph *new_graph = (CSRGraph *)malloc(sizeof(CSRGraph));
+  if (!new_graph) {
+    free(new_to_old);
+    free(old_to_new);
+    return NULL;
+  }
+
   new_graph->num_nodes = graph->num_nodes;
   new_graph->num_edges = graph->num_edges;
+  new_graph->d_row_ptr = NULL;
+  new_graph->d_col_idx = NULL;
 
   CUDA_CHECK(cudaMallocHost(&new_graph->h_row_ptr,
-                            (new_graph->num_nodes + 1) * sizeof(edge_t)));
+                            (size_t)(new_graph->num_nodes + 1) * sizeof(edge_t)));
   CUDA_CHECK(cudaMallocHost(&new_graph->h_col_idx,
-                            new_graph->num_edges * sizeof(node_t)));
+                            (size_t)new_graph->num_edges * sizeof(node_t)));
 
-  // Fill Row Pointers
   new_graph->h_row_ptr[0] = 0;
   for (node_t i = 0; i < graph->num_nodes; i++) {
     node_t u_old = new_to_old[i];
@@ -317,31 +387,44 @@ CSRGraph *reorderGraph(const CSRGraph *graph, ReorderMethod method) {
     new_graph->h_row_ptr[i + 1] = new_graph->h_row_ptr[i] + degree;
   }
 
-  // Fill Col Indices (with sorting for compression)
-  vector<node_t> row_neighbors;
-  row_neighbors.reserve(10000);
+  node_t *row_neighbors = NULL;
+  size_t row_neighbors_cap = 0;
 
   for (node_t i = 0; i < graph->num_nodes; i++) {
     node_t u_old = new_to_old[i];
     edge_t start = graph->h_row_ptr[u_old];
     edge_t end = graph->h_row_ptr[u_old + 1];
     edge_t new_start = new_graph->h_row_ptr[i];
+    size_t row_size = (size_t)(end - start);
 
-    // Collect and translate
-    row_neighbors.clear();
-    for (edge_t e = start; e < end; e++) {
-      node_t v_old = graph->h_col_idx[e];
-      row_neighbors.push_back(old_to_new[v_old]);
+    if (row_size > row_neighbors_cap) {
+      node_t *tmp = (node_t *)realloc(row_neighbors, row_size * sizeof(node_t));
+      if (!tmp) {
+        free(row_neighbors);
+        free(new_to_old);
+        free(old_to_new);
+        return new_graph;
+      }
+      row_neighbors = tmp;
+      row_neighbors_cap = row_size;
     }
 
-    // Sort by new ID for optimal compression
-    std::sort(row_neighbors.begin(), row_neighbors.end());
+    for (size_t j = 0; j < row_size; j++) {
+      node_t v_old = graph->h_col_idx[start + (edge_t)j];
+      row_neighbors[j] = old_to_new[v_old];
+    }
 
-    // Write
-    for (size_t j = 0; j < row_neighbors.size(); j++) {
-      new_graph->h_col_idx[new_start + j] = row_neighbors[j];
+    if (row_size > 1) {
+      qsort(row_neighbors, row_size, sizeof(node_t), compare_node_t_asc);
+    }
+
+    for (size_t j = 0; j < row_size; j++) {
+      new_graph->h_col_idx[new_start + (edge_t)j] = row_neighbors[j];
     }
   }
 
+  free(row_neighbors);
+  free(new_to_old);
+  free(old_to_new);
   return new_graph;
 }

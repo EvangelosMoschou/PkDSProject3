@@ -11,6 +11,7 @@
 #include "bfs_adaptive.h"
 #include "bfs_kernels.cuh"
 #include <stdio.h>
+#include <stdlib.h>
 
 #define THREAD_QUEUE_LIMIT 32
 #define WARP_QUEUE_LIMIT 1024
@@ -148,25 +149,9 @@ __global__ void bfsThreadKernel(const node_t *__restrict__ q, int q_size,
     for (edge_t e = start; e < end; e++) {
       node_t v = col_idx[e];
       level_t old = atomicCAS(&distances[v], UNVISITED, current_level + 1);
-      bool found = (old == UNVISITED);
-
-      // Warp Aggregation (V5.3)
-      unsigned int ballot = __ballot_sync(0xFFFFFFFF, found);
-      int pop_count = __popc(ballot);
-      int lane_id = threadIdx.x % 32;
-
-      if (pop_count > 0) {
-        int base_idx = 0;
-        if (lane_id == 0) {
-          base_idx = atomicAdd(next_frontier_size, pop_count);
-        }
-        base_idx = __shfl_sync(0xFFFFFFFF, base_idx, 0);
-
-        if (found) {
-          unsigned int mask = (1u << lane_id) - 1;
-          int local_offset = __popc(ballot & mask);
-          next_frontier[base_idx + local_offset] = v;
-        }
+      if (old == UNVISITED) {
+        int idx = atomicAdd(next_frontier_size, 1);
+        next_frontier[idx] = v;
       }
     }
   }
@@ -193,24 +178,9 @@ __global__ void bfsWarpKernel(const node_t *__restrict__ q, int q_size,
     for (edge_t e = start + lane_id; e < end; e += WARP_SIZE) {
       node_t v = col_idx[e];
       level_t old = atomicCAS(&distances[v], UNVISITED, current_level + 1);
-      bool found = (old == UNVISITED);
-
-      // Warp Aggregation (V5.3)
-      unsigned int ballot = __ballot_sync(0xFFFFFFFF, found);
-      int pop_count = __popc(ballot);
-
-      if (pop_count > 0) {
-        int base_idx = 0;
-        if (lane_id == 0) {
-          base_idx = atomicAdd(next_frontier_size, pop_count);
-        }
-        base_idx = __shfl_sync(0xFFFFFFFF, base_idx, 0);
-
-        if (found) {
-          unsigned int mask = (1u << lane_id) - 1;
-          int local_offset = __popc(ballot & mask);
-          next_frontier[base_idx + local_offset] = v;
-        }
+      if (old == UNVISITED) {
+        int idx = atomicAdd(next_frontier_size, 1);
+        next_frontier[idx] = v;
       }
     }
   }
@@ -231,30 +201,13 @@ __global__ void bfsBlockKernel(const node_t *__restrict__ q, int q_size,
     edge_t end = row_ptr[u + 1];
 
     int tid = threadIdx.x;
-    int lane_id = tid % 32;
 
     for (edge_t e = start + tid; e < end; e += blockDim.x) {
       node_t v = col_idx[e];
       level_t old = atomicCAS(&distances[v], UNVISITED, current_level + 1);
-      bool found = (old == UNVISITED);
-
-      // Warp Aggregation (V5.3) - Works even in block kernel (aggregation per
-      // warp)
-      unsigned int ballot = __ballot_sync(0xFFFFFFFF, found);
-      int pop_count = __popc(ballot);
-
-      if (pop_count > 0) {
-        int base_idx = 0;
-        if (lane_id == 0) {
-          base_idx = atomicAdd(next_frontier_size, pop_count);
-        }
-        base_idx = __shfl_sync(0xFFFFFFFF, base_idx, 0);
-
-        if (found) {
-          unsigned int mask = (1u << lane_id) - 1;
-          int local_offset = __popc(ballot & mask);
-          next_frontier[base_idx + local_offset] = v;
-        }
+      if (old == UNVISITED) {
+        int idx = atomicAdd(next_frontier_size, 1);
+        next_frontier[idx] = v;
       }
     }
   }
@@ -355,12 +308,12 @@ BFSResult *solveBFSAdaptiveWithThreshold(CSRGraph *graph, node_t source,
       int block_size = WARPS_PER_BLOCK * WARP_SIZE;
       int grid_warps = (num_nodes + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-      // Pass nullptr for visited_bitmap (optional, or just remove arg if kernel
-      // doesn't need it) Our _Direct kernel takes it but we can pass nullptr if
+      // Pass NULL for visited_bitmap (optional, or just remove arg if kernel
+      // doesn't need it) Our _Direct kernel takes it but we can pass NULL if
       // we rely on distances check.
       bfsBottomUpWarpKernel_Direct<<<grid_warps, block_size>>>(
           graph->d_row_ptr, graph->d_col_idx, d_distances, d_frontier_bitmap,
-          nullptr, d_next_frontier_size, d_next_frontier, level, num_nodes);
+          NULL, d_next_frontier_size, d_next_frontier, level, num_nodes);
 
       CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -429,12 +382,12 @@ BFSResult *solveBFSAdaptiveWithThreshold(CSRGraph *graph, node_t source,
 
   float elapsed = stopTimer(&timer);
 
-  BFSResult *res = new BFSResult;
+  BFSResult *res = (BFSResult *)malloc(sizeof(BFSResult));
   res->elapsed_ms = elapsed;
   res->num_nodes = num_nodes;
   res->source = source;
-  res->distances = new level_t[num_nodes];
-  res->parents = nullptr;
+  res->distances = (level_t *)malloc((size_t)num_nodes * sizeof(level_t));
+  res->parents = NULL;
 
   CUDA_CHECK(cudaMemcpy(res->distances, d_distances,
                         num_nodes * sizeof(level_t), cudaMemcpyDeviceToHost));

@@ -309,12 +309,12 @@ BFSResult *solveBFSAdaptiveWithThreshold(CSRGraph *graph, node_t source,
       int block_size = WARPS_PER_BLOCK * WARP_SIZE;
       int grid_warps = (num_nodes + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-      // Pass nullptr for visited_bitmap (optional, or just remove arg if kernel
-      // doesn't need it) Our _Direct kernel takes it but we can pass nullptr if
+      // Pass NULL for visited_bitmap (optional, or just remove arg if kernel
+      // doesn't need it) Our _Direct kernel takes it but we can pass NULL if
       // we rely on distances check.
       bfsBottomUpWarpKernel_Direct<<<grid_warps, block_size, 0>>>(
           graph->d_row_ptr, graph->d_col_idx, d_distances, d_frontier_bitmap,
-          nullptr, d_next_frontier_size, d_next_frontier, level, num_nodes);
+          NULL, d_next_frontier_size, d_next_frontier, level, num_nodes);
 
       CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -489,7 +489,7 @@ BFSResult *solveBFSMultiGPUSimulated(CSRGraph *graph, node_t source, int num_gpu
     level_t *distances;
     CUDA_CHECK(cudaMallocManaged(&distances, num_nodes * sizeof(level_t)));
     
-    // We can't use std::fill_n easily on managed memory until it's attached, 
+    // Managed memory initialization is done with cudaMemset for simplicity.
     // but a quick memset via unified memory works if device syncs.
     // Better to use cudaMemset:
     CUDA_CHECK(cudaMemset(distances, UNVISITED, num_nodes * sizeof(level_t)));

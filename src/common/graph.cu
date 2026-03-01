@@ -1,81 +1,126 @@
-#include "cuda_common.h" // For cudaMallocHostntl.h> // Added by user
 #include "graph.h"
 #include "io_utils.h"
-#include <algorithm>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <fcntl.h>
-#include <fstream>
-#include <string> // Added by user
-#include <sys/stat.h>
+#include <hdf5.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <vector>
 
-// =============================================================================
-// Graph Loading (Text Format)
-// =============================================================================
+static int compare_node_t_asc(const void *a, const void *b) {
+  node_t va = *(const node_t *)a;
+  node_t vb = *(const node_t *)b;
+  if (va < vb)
+    return -1;
+  if (va > vb)
+    return 1;
+  return 0;
+}
 
 CSRGraph *loadGraph(const char *filename) {
-  std::ifstream file(filename);
-  if (!file.is_open()) {
+  FILE *file = fopen(filename, "r");
+  if (!file) {
     fprintf(stderr, "Error: Cannot open file %s\n", filename);
-    return nullptr;
+    return NULL;
   }
 
-  node_t num_nodes;
-  edge_t num_edges;
-  file >> num_nodes >> num_edges;
+  node_t num_nodes = 0;
+  edge_t declared_edges = 0;
+  if (fscanf(file, "%d %lld", &num_nodes, &declared_edges) != 2 ||
+      num_nodes <= 0 || declared_edges < 0) {
+    fprintf(stderr, "Error: Invalid graph header in %s\n", filename);
+    fclose(file);
+    return NULL;
+  }
 
-  // Read edges into adjacency list
-  std::vector<std::vector<node_t>> adj(num_nodes);
+  edge_t *degree = (edge_t *)calloc((size_t)num_nodes, sizeof(edge_t));
+  if (!degree) {
+    fclose(file);
+    return NULL;
+  }
 
-  for (edge_t i = 0; i < num_edges; i++) {
-    node_t src, dst;
-    file >> src >> dst;
-
+  node_t src = 0;
+  node_t dst = 0;
+  while (fscanf(file, "%d %d", &src, &dst) == 2) {
     if (src >= 0 && src < num_nodes && dst >= 0 && dst < num_nodes) {
-      adj[src].push_back(dst);
-      // For undirected graphs, uncomment:
-      // adj[dst].push_back(src);
+      degree[src]++;
     }
   }
-  file.close();
+  fclose(file);
 
-  // Allocate CSR graph
-  CSRGraph *graph = new CSRGraph;
+  CSRGraph *graph = (CSRGraph *)malloc(sizeof(CSRGraph));
+  if (!graph) {
+    free(degree);
+    return NULL;
+  }
+
   graph->num_nodes = num_nodes;
   graph->num_edges = 0;
+  graph->d_row_ptr = NULL;
+  graph->d_col_idx = NULL;
 
-  // Count actual edges and allocate
+  CUDA_CHECK(cudaMallocHost(&graph->h_row_ptr,
+                            (size_t)(num_nodes + 1) * sizeof(edge_t)));
+
+  graph->h_row_ptr[0] = 0;
   for (node_t i = 0; i < num_nodes; i++) {
-    graph->num_edges += adj[i].size();
+    graph->h_row_ptr[i + 1] = graph->h_row_ptr[i] + degree[i];
+  }
+  graph->num_edges = graph->h_row_ptr[num_nodes];
+
+  CUDA_CHECK(cudaMallocHost(&graph->h_col_idx,
+                            (size_t)graph->num_edges * sizeof(node_t)));
+
+  edge_t *write_pos = (edge_t *)malloc((size_t)num_nodes * sizeof(edge_t));
+  if (!write_pos) {
+    CUDA_CHECK(cudaFreeHost(graph->h_row_ptr));
+    CUDA_CHECK(cudaFreeHost(graph->h_col_idx));
+    free(graph);
+    free(degree);
+    return NULL;
+  }
+  memcpy(write_pos, graph->h_row_ptr, (size_t)num_nodes * sizeof(edge_t));
+
+  file = fopen(filename, "r");
+  if (!file) {
+    free(write_pos);
+    free(degree);
+    CUDA_CHECK(cudaFreeHost(graph->h_row_ptr));
+    CUDA_CHECK(cudaFreeHost(graph->h_col_idx));
+    free(graph);
+    return NULL;
   }
 
-  CUDA_CHECK(
-      cudaMallocHost(&graph->h_row_ptr, (num_nodes + 1) * sizeof(edge_t)));
-  CUDA_CHECK(
-      cudaMallocHost(&graph->h_col_idx, graph->num_edges * sizeof(node_t)));
+  if (fscanf(file, "%d %lld", &src, &declared_edges) != 2) {
+    fclose(file);
+    free(write_pos);
+    free(degree);
+    CUDA_CHECK(cudaFreeHost(graph->h_row_ptr));
+    CUDA_CHECK(cudaFreeHost(graph->h_col_idx));
+    free(graph);
+    return NULL;
+  }
 
-  // Build CSR structure
-  edge_t edge_idx = 0;
-  for (node_t i = 0; i < num_nodes; i++) {
-    graph->h_row_ptr[i] = edge_idx;
-
-    // Sort neighbors for better cache locality
-    std::sort(adj[i].begin(), adj[i].end());
-
-    for (node_t neighbor : adj[i]) {
-      graph->h_col_idx[edge_idx++] = neighbor;
+  while (fscanf(file, "%d %d", &src, &dst) == 2) {
+    if (src >= 0 && src < num_nodes && dst >= 0 && dst < num_nodes) {
+      edge_t idx = write_pos[src]++;
+      graph->h_col_idx[idx] = dst;
     }
   }
-  graph->h_row_ptr[num_nodes] = edge_idx;
+  fclose(file);
 
-  // Initialize device pointers to null
-  graph->d_row_ptr = nullptr;
-  graph->d_col_idx = nullptr;
+  for (node_t i = 0; i < num_nodes; i++) {
+    edge_t begin = graph->h_row_ptr[i];
+    edge_t end = graph->h_row_ptr[i + 1];
+    if (end > begin) {
+      qsort(&graph->h_col_idx[begin], (size_t)(end - begin), sizeof(node_t),
+            compare_node_t_asc);
+    }
+  }
 
+  free(write_pos);
+  free(degree);
   return graph;
 }
 
@@ -84,10 +129,18 @@ CSRGraph *loadGraphCSRBin(const char *filename) {
   int fd = open(filename, O_RDONLY);
   if (fd < 0) {
     fprintf(stderr, "Error: Cannot open file %s\n", filename);
-    return nullptr;
+    return NULL;
   }
 
-  CSRGraph *graph = new CSRGraph;
+  CSRGraph *graph = (CSRGraph *)malloc(sizeof(CSRGraph));
+  if (!graph) {
+    close(fd);
+    return NULL;
+  }
+  graph->h_row_ptr = NULL;
+  graph->h_col_idx = NULL;
+  graph->d_row_ptr = NULL;
+  graph->d_col_idx = NULL;
   off_t offset = 0;
 
   // Read header (both are 8 bytes in our binary format)
@@ -96,16 +149,16 @@ CSRGraph *loadGraphCSRBin(const char *filename) {
   if (pread_full(fd, &n, sizeof(unsigned long long), offset) != 0) {
     fprintf(stderr, "Error reading num_nodes from %s\n", filename);
     close(fd);
-    delete graph;
-    return nullptr;
+    free(graph);
+    return NULL;
   }
   offset += sizeof(unsigned long long);
 
   if (pread_full(fd, &m, sizeof(unsigned long long), offset) != 0) {
     fprintf(stderr, "Error reading num_edges from %s\n", filename);
     close(fd);
-    delete graph;
-    return nullptr;
+    free(graph);
+    return NULL;
   }
   offset += sizeof(unsigned long long);
 
@@ -116,7 +169,7 @@ CSRGraph *loadGraphCSRBin(const char *filename) {
          (long long)graph->num_edges);
 
   // Allocate arrays
-  // Note: For massive graphs, we might want to map this instead of new[],
+  // Note: For massive graphs, memory-mapped loading could be considered,
   // but let's stick to standard allocation for now and trust copyGraphToDevice
   // to handle the GPU side. Friendster edges = 1.8B * 4 bytes = 7.2 GB. System
   // RAM is 32GB, so this fits easily.
@@ -134,8 +187,8 @@ CSRGraph *loadGraphCSRBin(const char *filename) {
     close(fd);
     cudaFreeHost(graph->h_row_ptr);
     cudaFreeHost(graph->h_col_idx);
-    delete graph;
-    return nullptr;
+    free(graph);
+    return NULL;
   }
   offset += (graph->num_nodes + 1) * sizeof(edge_t);
 
@@ -143,16 +196,16 @@ CSRGraph *loadGraphCSRBin(const char *filename) {
                  offset) != 0) {
     fprintf(stderr, "Error reading col_idx from %s\n", filename);
     close(fd);
-    delete[] graph->h_row_ptr;
-    delete[] graph->h_col_idx;
-    delete graph;
-    return nullptr;
+    cudaFreeHost(graph->h_row_ptr);
+    cudaFreeHost(graph->h_col_idx);
+    free(graph);
+    return NULL;
   }
 
   close(fd);
 
-  graph->d_row_ptr = nullptr;
-  graph->d_col_idx = nullptr;
+  graph->d_row_ptr = NULL;
+  graph->d_col_idx = NULL;
 
   printf("Graph Loaded Successfully.\n");
   return graph;
@@ -179,12 +232,6 @@ void saveGraphCSRBin(const CSRGraph *graph, const char *filename) {
   fclose(file);
 }
 
-// =============================================================================
-// HDF5 Loader
-// =============================================================================
-
-#include <hdf5.h>
-
 CSRGraph *loadGraphHDF5(const char *filename) {
   printf("Loading HDF5 Graph: %s\n", filename);
 
@@ -194,7 +241,7 @@ CSRGraph *loadGraphHDF5(const char *filename) {
   hid_t file_id = H5Fopen(filename, H5F_ACC_RDONLY, H5P_DEFAULT);
   if (file_id < 0) {
     fprintf(stderr, "Error: Cannot open HDF5 file %s\n", filename);
-    return nullptr;
+    return NULL;
   }
 
   // Navigate to /Problem/A
@@ -202,14 +249,14 @@ CSRGraph *loadGraphHDF5(const char *filename) {
   if (group_id < 0) {
     H5Fclose(file_id);
     fprintf(stderr, "Error: 'Problem' group not found in %s\n", filename);
-    return nullptr;
+    return NULL;
   }
   hid_t a_id = H5Gopen(group_id, "A", H5P_DEFAULT);
   if (a_id < 0) {
     H5Gclose(group_id);
     H5Fclose(file_id);
     fprintf(stderr, "Error: 'A' group/dataset not found in %s\n", filename);
-    return nullptr;
+    return NULL;
   }
 
   hid_t ir_dset = H5Dopen(a_id, "ir", H5P_DEFAULT);
@@ -224,7 +271,7 @@ CSRGraph *loadGraphHDF5(const char *filename) {
     H5Gclose(a_id);
     H5Gclose(group_id);
     H5Fclose(file_id);
-    return nullptr;
+    return NULL;
   }
 
   // Get Dimensions
@@ -239,9 +286,23 @@ CSRGraph *loadGraphHDF5(const char *filename) {
 
   printf("HDF5: Nodes=%d, Edges=%lld\n", num_nodes, (long long)num_edges);
 
-  CSRGraph *graph = new CSRGraph;
+  CSRGraph *graph = (CSRGraph *)malloc(sizeof(CSRGraph));
+  if (!graph) {
+    H5Sclose(ir_space);
+    H5Sclose(jc_space);
+    H5Dclose(ir_dset);
+    H5Dclose(jc_dset);
+    H5Gclose(a_id);
+    H5Gclose(group_id);
+    H5Fclose(file_id);
+    return NULL;
+  }
   graph->num_nodes = num_nodes;
   graph->num_edges = num_edges;
+  graph->h_row_ptr = NULL;
+  graph->h_col_idx = NULL;
+  graph->d_row_ptr = NULL;
+  graph->d_col_idx = NULL;
 
   // Allocate Memory
   printf(
@@ -262,30 +323,30 @@ CSRGraph *loadGraphHDF5(const char *filename) {
   if (H5Dread(jc_dset, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT,
               graph->h_row_ptr) < 0) {
     fprintf(stderr, "Error reading 'jc'\n");
-    delete[] graph->h_row_ptr;
-    delete[] graph->h_col_idx;
-    delete graph;
+    cudaFreeHost(graph->h_row_ptr);
+    cudaFreeHost(graph->h_col_idx);
+    free(graph);
     H5Dclose(ir_dset);
     H5Dclose(jc_dset);
     H5Gclose(a_id);
     H5Gclose(group_id);
     H5Fclose(file_id);
-    return nullptr;
+    return NULL;
   }
 
   printf("HDF5: Reading ir (col_idx)...\n");
   if (H5Dread(ir_dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
               graph->h_col_idx) < 0) {
     fprintf(stderr, "Error reading 'ir'\n");
-    delete[] graph->h_row_ptr;
-    delete[] graph->h_col_idx;
-    delete graph;
+    cudaFreeHost(graph->h_row_ptr);
+    cudaFreeHost(graph->h_col_idx);
+    free(graph);
     H5Dclose(ir_dset);
     H5Dclose(jc_dset);
     H5Gclose(a_id);
     H5Gclose(group_id);
     H5Fclose(file_id);
-    return nullptr;
+    return NULL;
   }
 
   printf("HDF5: Load Complete.\n");
@@ -298,22 +359,10 @@ CSRGraph *loadGraphHDF5(const char *filename) {
   H5Gclose(group_id);
   H5Fclose(file_id);
 
-  graph->d_row_ptr = nullptr;
-  graph->d_col_idx = nullptr;
+  graph->d_row_ptr = NULL;
+  graph->d_col_idx = NULL;
   return graph;
 }
-
-// =============================================================================
-// Memory Management
-// =============================================================================
-
-#include "io_utils.h"
-#include <fcntl.h>
-#include <unistd.h>
-
-// =============================================================================
-// Memory Management
-// =============================================================================
 
 void copyGraphToDevice(CSRGraph *graph) {
   size_t row_ptr_size = (graph->num_nodes + 1) * sizeof(edge_t);
@@ -369,21 +418,37 @@ void copyGraphToDevice(CSRGraph *graph) {
 
   // IMPORTANT: Do NOT free host memory. We need it to stream data to the GPU.
   // We accepted the trade-off of using 29GB system RAM (which is available).
-  // delete[] graph->h_row_ptr;
-  // graph->h_row_ptr = nullptr;
-  // delete[] graph->h_col_idx;
-  // graph->h_col_idx = nullptr;
+  // Host memory remains allocated for streaming/zero-copy use.
 }
 
 void freeGraphDevice(CSRGraph *graph) {
   if (graph->d_row_ptr) {
     CUDA_CHECK(cudaFree(graph->d_row_ptr));
-    graph->d_row_ptr = nullptr;
+    graph->d_row_ptr = NULL;
   }
   if (graph->d_col_idx) {
-    CUDA_CHECK(cudaFree(graph->d_col_idx));
-    graph->d_col_idx = nullptr;
+    cudaPointerAttributes attr;
+    cudaError_t err = cudaPointerGetAttributes(&attr, graph->d_col_idx);
+    if (err == cudaSuccess) {
+#if CUDART_VERSION >= 10000
+      if (attr.type == cudaMemoryTypeDevice ||
+          attr.type == cudaMemoryTypeManaged) {
+        CUDA_CHECK(cudaFree(graph->d_col_idx));
+      }
+#else
+      if (attr.memoryType == cudaMemoryTypeDevice) {
+        CUDA_CHECK(cudaFree(graph->d_col_idx));
+      }
+#endif
+    } else {
+      cudaGetLastError();
+    }
+    graph->d_col_idx = NULL;
   }
+}
+
+void setupZeroCopyCompressed(CompressedCSRGraph *graph) {
+  setupCompressedGraphDevice(graph);
 }
 
 void setupCompressedGraphDevice(CompressedCSRGraph *graph) {
@@ -398,6 +463,8 @@ void setupCompressedGraphDevice(CompressedCSRGraph *graph) {
 }
 
 void freeGraph(CSRGraph *graph) {
+  if (!graph)
+    return;
 
   freeGraphDevice(graph);
 
@@ -405,7 +472,7 @@ void freeGraph(CSRGraph *graph) {
     CUDA_CHECK(cudaFreeHost(graph->h_row_ptr));
   if (graph->h_col_idx)
     CUDA_CHECK(cudaFreeHost(graph->h_col_idx));
-  delete graph;
+  free(graph);
 }
 
 // =============================================================================

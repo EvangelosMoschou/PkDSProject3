@@ -81,11 +81,6 @@ CSRGraph *loadGraphHDF5(const char *filename);
  */
 void saveGraphCSRBin(const CSRGraph *graph, const char *filename);
 
-/**
- * Generate a random graph for testing
- */
-CSRGraph *generateRandomGraph(node_t num_nodes, edge_t avg_degree);
-
 // =============================================================================
 // Graph Memory Management
 // =============================================================================

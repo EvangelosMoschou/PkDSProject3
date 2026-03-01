@@ -1,7 +1,27 @@
 #include "compression.h"
-#include <algorithm>
 #include <cstdio>
-#include <vector>
+#include <cstdlib>
+
+static int compare_node_t_asc(const void *a, const void *b) {
+  node_t va = *(const node_t *)a;
+  node_t vb = *(const node_t *)b;
+  if (va < vb)
+    return -1;
+  if (va > vb)
+    return 1;
+  return 0;
+}
+
+static int ensureNodeBuffer(node_t **buffer, size_t *capacity, size_t needed) {
+  if (needed <= *capacity)
+    return 1;
+  node_t *tmp = (node_t *)realloc(*buffer, needed * sizeof(node_t));
+  if (!tmp)
+    return 0;
+  *buffer = tmp;
+  *capacity = needed;
+  return 1;
+}
 
 // =============================================================================
 // Variable-Length Quantity (Varint) Encoding (Host)
@@ -35,50 +55,39 @@ void compressGraph(const CSRGraph *input, CompressedCSRGraph *output) {
   CUDA_CHECK(
       cudaMallocHost(&output->h_row_Ptr, (num_nodes + 1) * sizeof(edge_t)));
 
-  // Temporary buffer to store compressed data (conservative size)
-  // Worst case: 5 bytes per edge + overhead.
-  // Optimization: We could do 2 passes (measure size, then allocate).
-  // For now, let's use std::vector for safety and copy at end, or just measure
-  // first.
-
   // PASS 1: Calculate Size
   size_t total_bytes = 0;
-
-  /*
-   * Note: We need to sort neighbors to perform Delta Encoding efficiently.
-   * We assume original CSR might not be sorted.
-   * Making a mutable copy of neighbors row by row might be slow but safe.
-   */
-
-  std::vector<node_t> neighbors;
-  std::vector<size_t> row_offsets(num_nodes + 1);
-  row_offsets[0] = 0;
+  node_t *neighbors = NULL;
+  size_t neighbors_cap = 0;
 
   for (node_t i = 0; i < num_nodes; i++) {
     edge_t start = input->h_row_ptr[i];
     edge_t end = input->h_row_ptr[i + 1];
     edge_t degree = end - start;
 
-    // Copy neighbors
-    neighbors.clear();
-    for (edge_t e = 0; e < degree; e++) {
-      neighbors.push_back(input->h_col_idx[start + e]);
+    if (!ensureNodeBuffer(&neighbors, &neighbors_cap, (size_t)degree)) {
+      free(neighbors);
+      fprintf(stderr, "compressGraph: allocation failed in pass 1\n");
+      output->compressed_size_bytes = 0;
+      return;
     }
 
-    // Sort
-    std::sort(neighbors.begin(), neighbors.end());
+    for (edge_t e = 0; e < degree; e++) {
+      neighbors[e] = input->h_col_idx[start + e];
+    }
+
+    if (degree > 1) {
+      qsort(neighbors, (size_t)degree, sizeof(node_t), compare_node_t_asc);
+    }
 
     // Calculate encoded size
     node_t prev = 0;
     size_t row_bytes = 0;
 
-    // Helper buffer for size calc
-    uint8_t tmp[5];
-
-    for (node_t neighbor : neighbors) {
+    for (edge_t k = 0; k < degree; k++) {
+      node_t neighbor = neighbors[k];
       node_t delta = neighbor - prev;
       int len = 0;
-      // Inline varint logic for speed or call func
       node_t val = delta;
       while (val > 127) {
         len++;
@@ -89,7 +98,6 @@ void compressGraph(const CSRGraph *input, CompressedCSRGraph *output) {
       prev = neighbor;
     }
     total_bytes += row_bytes;
-    row_offsets[i + 1] = total_bytes;
   }
 
   output->compressed_size_bytes = total_bytes;
@@ -98,8 +106,9 @@ void compressGraph(const CSRGraph *input, CompressedCSRGraph *output) {
          (double)(input->num_edges * 4) / total_bytes);
 
   // PASS 2: Encode
-  CUDA_CHECK(
-      cudaMallocHost(&output->h_compressed_col, total_bytes * sizeof(uint8_t)));
+  size_t alloc_bytes = total_bytes > 0 ? total_bytes : 1;
+  CUDA_CHECK(cudaMallocHost(&output->h_compressed_col,
+                            alloc_bytes * sizeof(uint8_t)));
 
   // Parallelize? Simple loop for now.
   size_t current_byte_offset = 0;
@@ -111,17 +120,22 @@ void compressGraph(const CSRGraph *input, CompressedCSRGraph *output) {
 
     output->h_row_Ptr[i] = (edge_t)current_byte_offset;
 
-    // Copy & Sort (Repeated work, but allows Pass 1 to be just a size sum if we
-    // optimized) Optimization: We re-do internal logic to avoid storing vector
-    // of vectors
-    neighbors.clear();
-    for (edge_t e = 0; e < degree; e++) {
-      neighbors.push_back(input->h_col_idx[start + e]);
+    if (!ensureNodeBuffer(&neighbors, &neighbors_cap, (size_t)degree)) {
+      free(neighbors);
+      fprintf(stderr, "compressGraph: allocation failed in pass 2\n");
+      return;
     }
-    std::sort(neighbors.begin(), neighbors.end());
+
+    for (edge_t e = 0; e < degree; e++) {
+      neighbors[e] = input->h_col_idx[start + e];
+    }
+    if (degree > 1) {
+      qsort(neighbors, (size_t)degree, sizeof(node_t), compare_node_t_asc);
+    }
 
     node_t prev = 0;
-    for (node_t neighbor : neighbors) {
+    for (edge_t k = 0; k < degree; k++) {
+      node_t neighbor = neighbors[k];
       node_t delta = neighbor - prev;
       current_byte_offset +=
           encode_varint(&output->h_compressed_col[current_byte_offset], delta);
@@ -129,6 +143,8 @@ void compressGraph(const CSRGraph *input, CompressedCSRGraph *output) {
     }
   }
   output->h_row_Ptr[num_nodes] = (edge_t)total_bytes;
+
+  free(neighbors);
 
   printf("Compression Complete.\n");
 }
@@ -157,7 +173,8 @@ bool compressGraphInPlace(CSRGraph *input, CompressedCSRGraph *output) {
   size_t write_offset = 0; // In Bytes
   bool safe = true;
 
-  std::vector<node_t> neighbors;
+  node_t *neighbors = NULL;
+  size_t neighbors_cap = 0;
 
   // We need to calculate row offsets first to fill h_row_Ptr
 
@@ -180,17 +197,26 @@ bool compressGraphInPlace(CSRGraph *input, CompressedCSRGraph *output) {
     // Wait, if write_offset > end_idx*4, we have overflowed into the next
     // unread row.
 
-    // Copy & Sort
-    neighbors.clear();
-    for (edge_t e = 0; e < degree; e++) {
-      neighbors.push_back(input->h_col_idx[start_idx + e]);
+    if (!ensureNodeBuffer(&neighbors, &neighbors_cap, (size_t)degree)) {
+      free(neighbors);
+      CUDA_CHECK(cudaFreeHost(output->h_row_Ptr));
+      output->h_row_Ptr = NULL;
+      output->h_compressed_col = NULL;
+      return false;
     }
-    std::sort(neighbors.begin(), neighbors.end());
+
+    for (edge_t e = 0; e < degree; e++) {
+      neighbors[e] = input->h_col_idx[start_idx + e];
+    }
+    if (degree > 1) {
+      qsort(neighbors, (size_t)degree, sizeof(node_t), compare_node_t_asc);
+    }
 
     // Calculate Size
     size_t row_bytes = 0;
     node_t prev = 0;
-    for (node_t neighbor : neighbors) {
+    for (edge_t k = 0; k < degree; k++) {
+      node_t neighbor = neighbors[k];
       node_t delta = neighbor - prev;
       node_t val = delta;
       while (val > 127) {
@@ -214,7 +240,8 @@ bool compressGraphInPlace(CSRGraph *input, CompressedCSRGraph *output) {
     // neighbors) Optimization: Single Pass In-Place
 
     node_t prev_enc = 0;
-    for (node_t neighbor : neighbors) {
+    for (edge_t k = 0; k < degree; k++) {
+      node_t neighbor = neighbors[k];
       node_t delta = neighbor - prev_enc;
       write_offset +=
           encode_varint(&output->h_compressed_col[write_offset], delta);
@@ -228,8 +255,9 @@ bool compressGraphInPlace(CSRGraph *input, CompressedCSRGraph *output) {
   if (!safe) {
     // Cleanup allocated row ptr
     CUDA_CHECK(cudaFreeHost(output->h_row_Ptr));
-    output->h_row_Ptr = nullptr;
-    output->h_compressed_col = nullptr;
+    output->h_row_Ptr = NULL;
+    output->h_compressed_col = NULL;
+    free(neighbors);
     return false;
   }
 
@@ -240,5 +268,6 @@ bool compressGraphInPlace(CSRGraph *input, CompressedCSRGraph *output) {
   // ALREADY PINNED via cudaMallocHost (in loadGraph)
   // CUDA_CHECK(cudaHostRegister(output->h_compressed_col,
   // output->compressed_size_bytes, cudaHostRegisterMapped));
+  free(neighbors);
   return true;
 }

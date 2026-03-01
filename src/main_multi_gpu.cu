@@ -65,10 +65,12 @@ int main(int argc, char **argv) {
     BFSResult *result = NULL;
     if (options.compression) {
 #ifdef USE_V41_HYBRID
-      fprintf(stderr,
-              "Compressed BFS not available in V4.1. Running standard BFS...\n");
-      result = solveBFSAdaptiveWithThreshold(graph, options.source,
-                                             options.bu_threshold_divisor);
+      printf("\nCompressing Graph (c-CSR)...\n");
+      CompressedCSRGraph comp_graph;
+      compressGraph(graph, &comp_graph);
+      setupCompressedGraphDevice(&comp_graph);
+      printf("Running Adaptive BFS (Compressed Single GPU, V4.1)...\n");
+      result = solveBFSCompressedAdaptive(&comp_graph, options.source);
 #else
       printf("\nCompressing Graph (c-CSR)...\n");
       CompressedCSRGraph comp_graph;

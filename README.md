@@ -104,6 +104,43 @@ make pgo-use
 ./bin/bfs_v4_1_hybrid <graph_file> --algo afforest --compress
 ```
 
+## Universal Benchmarking (Cross-Machine)
+
+Raw time in ms is useful, but a more portable comparison metric is:
+
+- `MTEPS` = million traversed edges per second
+- `ns/edge` = nanoseconds spent per traversed edge
+
+Use the helper script:
+
+```bash
+bash scripts/benchmark_universal.sh --graph "Mat Files/road_usa.bin" --trials 5
+```
+
+### Latest Universal Results (Road USA, Compressed, 3 Trials)
+
+| Binary | Median Time (ms) | Median MTEPS | Median ns/edge | Median MNPS |
+| :--- | ---: | ---: | ---: | ---: |
+| `bin/bfs_v4_1_hybrid` | 1132.285 | 50.967 | 19.621 | 21.150 |
+| `bin/bfs_v5_multi_gpu` | 1188.301 | 48.564 | 20.591 | 20.153 |
+
+Reproduce with:
+
+```bash
+bash scripts/benchmark_universal.sh --bin bin/bfs_v4_1_hybrid --graph "Mat Files/road_usa.bin" --trials 3
+bash scripts/benchmark_universal.sh --bin bin/bfs_v5_multi_gpu --graph "Mat Files/road_usa.bin" --trials 3
+```
+
+Optional examples:
+
+```bash
+# Uncompressed
+bash scripts/benchmark_universal.sh --graph "Mat Files/road_usa.bin" --no-compress --trials 5
+
+# Different source and extra args
+bash scripts/benchmark_universal.sh --graph "Mat Files/road_usa.bin" --source 42 --extra-args "--validate"
+```
+
 ### Supported Graph Formats
 -   `.mat` (MATLAB sparse matrix, HDF5)
 -   `.csrbin` (Binary CSR)
